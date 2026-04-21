@@ -1,0 +1,20 @@
+# Environment variables - NEVER commit these
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Node
+node_modules/
+.next/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IBKR Gateway
+clientportal.gw/
