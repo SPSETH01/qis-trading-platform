@@ -1,16 +1,21 @@
 import requests
 import os
+import urllib3
 from dotenv import load_dotenv
 from loguru import logger
+
+# Suppress SSL warnings for localhost
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 load_dotenv()
 
 class IBKRClient:
     def __init__(self):
-        self.base_url = os.getenv("IBKR_BASE_URL", "https://localhost:5000/v1/api")
+        self.base_url = os.getenv("IBKR_BASE_URL", "https://localhost:5001/v1/api")
         self.paper = os.getenv("IBKR_PAPER", "true").lower() == "true"
+        self.account_id = os.getenv("IBKR_ACCOUNT_ID", "U25402501")
         self.session = requests.Session()
-        self.session.verify = False  # IBKR gateway uses self-signed cert
+        self.session.verify = False
         logger.info(f"IBKR Client initialized — Paper: {self.paper}")
 
     # ─── CONNECTION ────────────────────────────────────────────
@@ -18,11 +23,17 @@ class IBKRClient:
     def check_connection(self):
         """Check if IBKR gateway is running"""
         try:
-            response = self.session.get(f"{self.base_url}/iserver/auth/status")
-            data = response.json()
-            connected = data.get("authenticated", False)
-            logger.info(f"IBKR Connection: {'✅ Connected' if connected else '❌ Disconnected'}")
-            return connected
+            response = self.session.get(
+                f"{self.base_url}/iserver/auth/status",
+                verify=False,
+                timeout=10
+            )
+            if response.status_code == 200 and response.text.strip():
+                data = response.json()
+                connected = data.get("authenticated", False)
+                logger.info(f"IBKR Connection: {'✅ Connected' if connected else '❌ Disconnected'}")
+                return connected
+            return False
         except Exception as e:
             logger.error(f"IBKR Connection failed: {e}")
             return False
@@ -30,7 +41,11 @@ class IBKRClient:
     def get_account(self):
         """Get account details"""
         try:
-            response = self.session.get(f"{self.base_url}/portfolio/accounts")
+            response = self.session.get(
+                f"{self.base_url}/portfolio/accounts",
+                verify=False,
+                timeout=10
+            )
             return response.json()
         except Exception as e:
             logger.error(f"Failed to get account: {e}")
@@ -39,12 +54,10 @@ class IBKRClient:
     def get_portfolio_value(self):
         """Get total portfolio value"""
         try:
-            accounts = self.get_account()
-            if not accounts:
-                return float(os.getenv("STARTING_CAPITAL", 500))
-            account_id = accounts[0]["id"]
             response = self.session.get(
-                f"{self.base_url}/portfolio/{account_id}/summary"
+                f"{self.base_url}/portfolio/{self.account_id}/summary",
+                verify=False,
+                timeout=10
             )
             data = response.json()
             value = data.get("netliquidation", {}).get("amount", 500)
@@ -64,11 +77,13 @@ class IBKRClient:
                 return None
             response = self.session.get(
                 f"{self.base_url}/iserver/marketdata/snapshot",
-                params={"conids": conid, "fields": "31,84,86"}
+                params={"conids": conid, "fields": "31,84,86"},
+                verify=False,
+                timeout=10
             )
             data = response.json()
             if data:
-                price = data[0].get("31")  # last price
+                price = data[0].get("31")
                 logger.info(f"{symbol} price: ${price}")
                 return float(price) if price else None
         except Exception as e:
@@ -80,7 +95,9 @@ class IBKRClient:
         try:
             response = self.session.get(
                 f"{self.base_url}/iserver/secdef/search",
-                params={"symbol": symbol}
+                params={"symbol": symbol},
+                verify=False,
+                timeout=10
             )
             data = response.json()
             if data:
@@ -97,11 +114,9 @@ class IBKRClient:
                 return None
             response = self.session.get(
                 f"{self.base_url}/iserver/marketdata/history",
-                params={
-                    "conid": conid,
-                    "period": period,
-                    "bar": bar
-                }
+                params={"conid": conid, "period": period, "bar": bar},
+                verify=False,
+                timeout=10
             )
             data = response.json()
             return data.get("data", [])
@@ -114,11 +129,6 @@ class IBKRClient:
     def place_order(self, symbol, side, quantity, order_type="MKT"):
         """Place a trade order"""
         try:
-            accounts = self.get_account()
-            if not accounts:
-                logger.error("No account found")
-                return None
-            account_id = accounts[0]["id"]
             conid = self.get_conid(symbol)
             if not conid:
                 logger.error(f"No conid found for {symbol}")
@@ -127,14 +137,16 @@ class IBKRClient:
             order = {
                 "conid": conid,
                 "orderType": order_type,
-                "side": side.upper(),  # BUY or SELL
+                "side": side.upper(),
                 "quantity": quantity,
                 "tif": "DAY"
             }
 
             response = self.session.post(
-                f"{self.base_url}/iserver/account/{account_id}/orders",
-                json={"orders": [order]}
+                f"{self.base_url}/iserver/account/{self.account_id}/orders",
+                json={"orders": [order]},
+                verify=False,
+                timeout=10
             )
             result = response.json()
             logger.info(f"Order placed: {side} {quantity} {symbol} → {result}")
@@ -147,12 +159,10 @@ class IBKRClient:
     def get_positions(self):
         """Get current open positions"""
         try:
-            accounts = self.get_account()
-            if not accounts:
-                return []
-            account_id = accounts[0]["id"]
             response = self.session.get(
-                f"{self.base_url}/portfolio/{account_id}/positions/0"
+                f"{self.base_url}/portfolio/{self.account_id}/positions/0",
+                verify=False,
+                timeout=10
             )
             return response.json()
         except Exception as e:

@@ -1,0 +1,12 @@
+2026-04-21 18:29:12.096 | INFO     | __main__:__init__:34 - 🚀 QIS Trading Engine initialising...
+2026-04-21 18:29:12.096 | INFO     | ibkr_client:__init__:14 - IBKR Client initialized — Paper: True
+2026-04-21 18:29:12.096 | INFO     | __main__:__init__:53 - Engine ready — Starting capital: $500.00
+2026-04-21 18:29:12.114 | ERROR    | ibkr_client:check_connection:27 - IBKR Connection failed: HTTPSConnectionPool(host='localhost', port=5001): Max retries exceeded with url: /v1/api/iserver/auth/status (Caused by NewConnectionError("HTTPSConnection(host='localhost', port=5001): Failed to establish a new connection: [Errno 61] Connection refused"))
+2026-04-21 18:29:12.114 | WARNING  | __main__:<module>:265 - ⚠️  IBKR gateway not connected — start Client Portal Gateway first
+2026-04-21 18:29:12.114 | INFO     | __main__:<module>:269 - Running in simulation mode...
+2026-04-21 18:29:12.115 | INFO     | __main__:<module>:272 - Starting QIS Trading Engine...
+2026-04-21 18:29:12.141 | INFO     | __main__:start_scheduler:243 - 📅 Scheduler started:
+2026-04-21 18:29:12.142 | INFO     | __main__:start_scheduler:244 -   Macro Regime    → weekdays 9:35am ET
+2026-04-21 18:29:12.142 | INFO     | __main__:start_scheduler:245 -   Crypto Trend    → every 4 hours 24/7
+2026-04-21 18:29:12.142 | INFO     | __main__:start_scheduler:246 -   Thematic Rotation → Mondays 9:40am ET
+2026-04-21 18:32:47.859 | INFO     | __main__:start_scheduler:251 - Engine stopped by user

@@ -1,0 +1,3 @@
+2026-04-21 18:46:31.805 | INFO     | __main__:__init__:34 - 🚀 QIS Trading Engine initialising...
+2026-04-21 18:46:31.806 | INFO     | ibkr_client:__init__:14 - IBKR Client initialized — Paper: True
+2026-04-21 18:46:31.806 | INFO     | __main__:__init__:53 - Engine ready — Starting capital: $500.00
