@@ -16,6 +16,26 @@ class IBKRClient:
         self.account_id = os.getenv("IBKR_ACCOUNT_ID", "U25402501")
         self.session = requests.Session()
         self.session.verify = False
+
+        # Hardcoded conids for fast lookup
+        self.CONIDS = {
+            # ETFs
+            "SPY":  "756733",
+            "QQQ":  "320227571",
+            "GLD":  "51529211",
+            "TLT":  "15547841",
+            "SH":   "738523410",
+            "SDS":  "828937764",
+            # Thematic ETFs
+            "BOTZ": "247691382",
+            "BLOK": "302902491",
+            # Crypto
+            "BTC":  "541686651",
+            "ETH":  "541686654",
+            # Indices
+            "VIX":  "13455763",
+        }
+
         logger.info(f"IBKR Client initialized — Paper: {self.paper}")
 
     # ─── CONNECTION ────────────────────────────────────────────
@@ -90,21 +110,29 @@ class IBKRClient:
             logger.error(f"Failed to get price for {symbol}: {e}")
             return None
 
+
     def get_conid(self, symbol):
-        """Get IBKR contract ID for a symbol"""
-        try:
-            response = self.session.get(
-                f"{self.base_url}/iserver/secdef/search",
-                params={"symbol": symbol},
-                verify=False,
-                timeout=10
-            )
-            data = response.json()
-            if data:
-                return data[0].get("conid")
-        except Exception as e:
-            logger.error(f"Failed to get conid for {symbol}: {e}")
-            return None
+    """Get IBKR contract ID for a symbol"""
+    # Check hardcoded map first
+    if symbol in self.CONIDS and self.CONIDS[symbol]:
+        return self.CONIDS[symbol]
+    try:
+        response = self.session.post(
+            f"{self.base_url}/iserver/secdef/search",
+            json={"symbol": symbol},
+            verify=False,
+            timeout=10
+        )
+        data = response.json()
+        if data:
+            conid = data[0].get("conid")
+            # Cache it
+            self.CONIDS[symbol] = conid
+            return conid
+    except Exception as e:
+        logger.error(f"Failed to get conid for {symbol}: {e}")
+        return None
+
 
     def get_historical_data(self, symbol, period="1M", bar="1d"):
         """Get historical OHLCV data"""
