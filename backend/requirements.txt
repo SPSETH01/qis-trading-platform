@@ -22,3 +22,5 @@ loguru==0.7.2
 # Web server (for dashboard API)
 fastapi==0.109.2
 uvicorn==0.27.1
+
+gunicorn==21.2.0
