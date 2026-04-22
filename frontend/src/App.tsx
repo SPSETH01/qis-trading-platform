@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
 
-const API_URL = 'http://localhost:8000';
+const API_URL = 'https://qis-trading-platform-production.up.railway.app';
 
 // ─── TYPES ────────────────────────────────────────────────────
 
