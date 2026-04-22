@@ -1,0 +1,26 @@
+# IBKR API
+ibind==0.1.7
+
+# Data & Analysis
+pandas==2.2.3
+numpy==2.1.0
+ta==0.11.0
+
+# Scheduling
+apscheduler==3.10.4
+
+# HTTP
+requests==2.31.0
+aiohttp==3.9.3
+
+# Environment
+python-dotenv==1.0.0
+
+# Logging
+loguru==0.7.2
+
+# Web server (for dashboard API)
+fastapi==0.109.2
+uvicorn==0.27.1
+
+gunicorn==21.2.0
