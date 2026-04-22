@@ -112,26 +112,26 @@ class IBKRClient:
 
 
     def get_conid(self, symbol):
-    """Get IBKR contract ID for a symbol"""
-    # Check hardcoded map first
-    if symbol in self.CONIDS and self.CONIDS[symbol]:
-        return self.CONIDS[symbol]
-    try:
-        response = self.session.post(
-            f"{self.base_url}/iserver/secdef/search",
-            json={"symbol": symbol},
-            verify=False,
-            timeout=10
-        )
-        data = response.json()
-        if data:
-            conid = data[0].get("conid")
-            # Cache it
-            self.CONIDS[symbol] = conid
-            return conid
-    except Exception as e:
-        logger.error(f"Failed to get conid for {symbol}: {e}")
-        return None
+        """Get IBKR contract ID for a symbol"""
+        # Check hardcoded map first
+        if symbol in self.CONIDS and self.CONIDS[symbol]:
+            return self.CONIDS[symbol]
+        try:
+            response = self.session.post(
+                f"{self.base_url}/iserver/secdef/search",
+                json={"symbol": symbol},
+                verify=False,
+                timeout=10
+            )
+            data = response.json()
+            if data:
+                conid = data[0].get("conid")
+                # Cache it
+                self.CONIDS[symbol] = conid
+                return conid
+        except Exception as e:
+            logger.error(f"Failed to get conid for {symbol}: {e}")
+            return None
 
 
     def get_historical_data(self, symbol, period="1M", bar="1d"):

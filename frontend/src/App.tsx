@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
 
+const API_URL = 'http://localhost:8000';
+
 // ─── TYPES ────────────────────────────────────────────────────
 
 interface Trade {
@@ -295,6 +297,47 @@ export default function App() {
   const pnl = portfolioValue - 500;
   const pnlPct = ((pnl / 500) * 100).toFixed(2);
   const totalPnl = MOCK_POSITIONS.reduce((sum, p) => sum + p.pnl, 0);
+
+    // ─── LIVE DATA ──────────────────────────────────────────────
+  const [livePortfolio, setLivePortfolio] = useState<any>(null);
+  const [liveSignals, setLiveSignals] = useState<any[]>([]);
+  const [livePositions, setLivePositions] = useState<any[]>([]);
+  const [liveRegime, setLiveRegime] = useState<string>('LOADING...');
+  const [connected, setConnected] = useState<boolean>(false);
+
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        const statusRes = await fetch(`${API_URL}/api/status`);
+        const status = await statusRes.json();
+        setConnected(status.connected);
+
+        const portfolioRes = await fetch(`${API_URL}/api/portfolio`);
+        const portfolio = await portfolioRes.json();
+        setLivePortfolio(portfolio);
+
+        const signalsRes = await fetch(`${API_URL}/api/signals`);
+        const signals = await signalsRes.json();
+        setLiveSignals(signals.signals || []);
+
+        const positionsRes = await fetch(`${API_URL}/api/positions`);
+        const positions = await positionsRes.json();
+        setLivePositions(positions.positions || []);
+
+        const regimeRes = await fetch(`${API_URL}/api/regime`);
+        const regime = await regimeRes.json();
+        setLiveRegime(regime.regime || 'UNKNOWN');
+
+      } catch (e) {
+        console.error('API fetch error:', e);
+      }
+    };
+
+    fetchData();
+    const interval = setInterval(fetchData, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
 
   return (
     <div style={S.app}>
