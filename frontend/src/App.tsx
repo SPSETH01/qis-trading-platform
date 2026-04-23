@@ -1,5 +1,6 @@
+/* eslint-disable @typescript-eslint/no-unused-vars */
 import { useState, useEffect } from 'react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
+import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
 
 const API_URL = 'https://qis-trading-platform-production.up.railway.app';
 
@@ -290,7 +291,6 @@ const Metric = ({ label, value, sub, color }: {
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [growthData] = useState(generateGrowthData());
-  const [regime, setRegime] = useState('MILD_BULL');
   const [paperMode] = useState(true);
 
   const portfolioValue = growthData[growthData.length - 1]?.value || 500;
