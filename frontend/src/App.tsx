@@ -414,7 +414,7 @@ export default function App() {
           />
           <Metric
             label="Market Regime"
-            value={regime}
+            value={liveRegime}
             sub="Bear score: 2/6"
             color="#00e5ff"
           />
