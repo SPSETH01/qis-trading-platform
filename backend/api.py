@@ -2,11 +2,15 @@ import asyncio
 import sys
 import os
 from datetime import datetime
+import pytz
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from loguru import logger
 from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from ibkr_client import IBKRClient
 from strategies.macro_regime import MacroRegimeStrategy
@@ -37,11 +41,228 @@ thematic = ThematicRotationStrategy(client)
 starting_capital = float(os.getenv("STARTING_CAPITAL", 500))
 peak_value       = starting_capital
 
+# ─── SCHEDULER + SIGNAL MONITOR ──────────────────────────────
+
+ET = pytz.timezone("America/New_York")
+
+scheduler = BackgroundScheduler(timezone=ET)
+
+scheduler_state = {
+    "running":        False,
+    "paused":         False,
+    "last_run":       {},    # strategy -> last run timestamp
+    "last_error":     {},    # strategy -> last error message
+    "error_count":    0,
+    "signal_history": {},    # signal_id -> last known value
+    "last_signal_check": None,
+}
+
+STRATEGY_MAP = lambda: {
+    "macro_regime":      macro,
+    "crypto_trend":      crypto,
+    "thematic_rotation": thematic,
+}
+
+# ── Signal trigger rules ──────────────────────────────────────
+# Each rule defines when a signal change should trigger a strategy run
+SIGNAL_TRIGGERS = [
+    {
+        "signal_id":  "vix_bear",
+        "strategy":   "macro_regime",
+        "description": "VIX crosses bear threshold",
+    },
+    {
+        "signal_id":  "spy_regime",
+        "strategy":   "macro_regime",
+        "description": "SPY regime changes",
+    },
+    {
+        "signal_id":  "btc_trend",
+        "strategy":   "crypto_trend",
+        "description": "BTC trend signal changes",
+    },
+    {
+        "signal_id":  "eth_trend",
+        "strategy":   "crypto_trend",
+        "description": "ETH trend signal changes",
+    },
+]
+
+def _execute_strategy(strategy_name: str, trigger: str = "scheduled"):
+    """
+    Core strategy execution — used by both signal monitor and scheduled runs.
+    On error — pauses all jobs and logs failure.
+    """
+    if scheduler_state["paused"]:
+        logger.warning(f"Scheduler paused — skipping {strategy_name}")
+        return None
+
+    logger.info(f"🚀 Running {strategy_name} [trigger: {trigger}]")
+
+    try:
+        if not client.check_connection():
+            raise RuntimeError("TWS not connected")
+
+        portfolio_value = client.get_portfolio_value()
+        result = STRATEGY_MAP()[strategy_name].run(portfolio_value)
+
+        scheduler_state["last_run"][strategy_name] = datetime.now(ET).isoformat()
+        scheduler_state["last_error"].pop(strategy_name, None)
+        logger.info(f"✅ {strategy_name} complete [{trigger}] — result: {result}")
+        return result
+
+    except Exception as e:
+        error_msg = str(e)
+        scheduler_state["last_error"][strategy_name] = error_msg
+        scheduler_state["error_count"] += 1
+        logger.error(f"❌ {strategy_name} FAILED [{trigger}]: {error_msg}")
+        logger.error("🛑 Pausing all scheduled runs — use /api/scheduler/resume to restart")
+        scheduler_state["paused"] = True
+        for job in scheduler.get_jobs():
+            job.pause()
+        return None
+
+def _fetch_current_signals():
+    """
+    Fetch current signal values from TWS.
+    Returns dict of signal_id -> current value.
+    Lightweight — only fetches what's needed for change detection.
+    """
+    signals = {}
+    try:
+        # VIX bear threshold
+        vix = client.get_price("VIX")
+        vix_threshold = float(os.getenv("VIX_BEAR_THRESHOLD", 20))
+        signals["vix_bear"] = "triggered" if vix and vix > vix_threshold else "waiting"
+
+        # SPY regime
+        spy_data = client.get_historical_data("SPY", period="1Y", bar="1d")
+        if spy_data:
+            regime = macro.get_regime(vix, spy_data)
+            signals["spy_regime"] = regime
+
+        # BTC trend
+        btc_data = client.get_historical_data("BTC", period="1Y", bar="1d")
+        if btc_data:
+            signals["btc_trend"] = crypto.get_trend_signal("BTC", btc_data)
+
+        # ETH trend
+        eth_data = client.get_historical_data("ETH", period="1Y", bar="1d")
+        if eth_data:
+            signals["eth_trend"] = crypto.get_trend_signal("ETH", eth_data)
+
+    except Exception as e:
+        logger.error(f"Signal fetch error: {e}")
+
+    return signals
+
+def _signal_monitor():
+    """
+    Runs every 15 minutes.
+    Fetches current signals, compares to previous state.
+    Triggers relevant strategy if any signal changes.
+    """
+    if scheduler_state["paused"]:
+        return
+
+    logger.info("🔍 Signal monitor checking...")
+    scheduler_state["last_signal_check"] = datetime.now(ET).isoformat()
+
+    try:
+        current_signals = _fetch_current_signals()
+        previous_signals = scheduler_state["signal_history"]
+        triggered_strategies = set()
+
+        for trigger_rule in SIGNAL_TRIGGERS:
+            signal_id  = trigger_rule["signal_id"]
+            strategy   = trigger_rule["strategy"]
+            desc       = trigger_rule["description"]
+
+            current_val  = current_signals.get(signal_id)
+            previous_val = previous_signals.get(signal_id)
+
+            if current_val is None:
+                continue
+
+            # Signal changed state
+            if current_val != previous_val:
+                logger.info(
+                    f"🔔 Signal change detected: {signal_id} "
+                    f"{previous_val} → {current_val} ({desc})"
+                )
+                triggered_strategies.add(strategy)
+
+        # Update signal history
+        scheduler_state["signal_history"].update(current_signals)
+
+        # Execute triggered strategies (deduplicated)
+        for strategy_name in triggered_strategies:
+            logger.info(f"⚡ Signal-driven trigger: {strategy_name}")
+            _execute_strategy(strategy_name, trigger="signal_change")
+
+        if not triggered_strategies:
+            logger.info(f"✅ Signal monitor: no changes detected — signals: {current_signals}")
+
+    except Exception as e:
+        logger.error(f"Signal monitor error: {e}")
+
+def _setup_scheduler():
+    """Configure signal monitor + fallback scheduled runs"""
+
+    # ── PRIMARY: Signal monitor every 15 minutes ──────────────
+    scheduler.add_job(
+        func=_signal_monitor,
+        trigger=IntervalTrigger(minutes=15, timezone=ET),
+        id="signal_monitor",
+        name="Signal Monitor — every 15min",
+        replace_existing=True,
+    )
+
+    # ── FALLBACK: Scheduled safety nets ───────────────────────
+
+    # Macro Regime — weekdays 9:35 AM ET
+    scheduler.add_job(
+        func=_execute_strategy,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=35, timezone=ET),
+        args=["macro_regime", "scheduled_fallback"],
+        id="macro_regime",
+        name="Macro Regime — 9:35 AM ET fallback",
+        replace_existing=True,
+    )
+
+    # Crypto Trend — every 4 hours 24/7
+    scheduler.add_job(
+        func=_execute_strategy,
+        trigger=IntervalTrigger(hours=4, timezone=ET),
+        args=["crypto_trend", "scheduled_fallback"],
+        id="crypto_trend",
+        name="Crypto Trend — every 4h fallback",
+        replace_existing=True,
+    )
+
+    # Thematic Rotation — weekdays 9:40 AM ET
+    scheduler.add_job(
+        func=_execute_strategy,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=40, timezone=ET),
+        args=["thematic_rotation", "scheduled_fallback"],
+        id="thematic_rotation",
+        name="Thematic Rotation — 9:40 AM ET fallback",
+        replace_existing=True,
+    )
+
+    scheduler.start()
+    scheduler_state["running"] = True
+    logger.info("⏰ Scheduler started:")
+    logger.info("   signal_monitor    → every 15 minutes (primary)")
+    logger.info("   macro_regime      → weekdays 9:35 AM ET (fallback)")
+    logger.info("   crypto_trend      → every 4h (fallback)")
+    logger.info("   thematic_rotation → weekdays 9:40 AM ET (fallback)")
+
 # ─── STARTUP ──────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup_event():
-    """Auto-connect to TWS on startup"""
+    """Auto-connect to TWS on startup and start scheduler"""
     logger.info("QIS Platform starting — connecting to TWS...")
     try:
         result = client.connect()
@@ -51,6 +272,19 @@ async def startup_event():
             logger.warning("⚠️  TWS auto-connect failed — use /api/auth/connect to retry")
     except Exception as e:
         logger.error(f"Startup connect error: {e}")
+
+    # Start scheduler
+    try:
+        _setup_scheduler()
+    except Exception as e:
+        logger.error(f"Scheduler startup error: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Gracefully shut down scheduler"""
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+        logger.info("Scheduler stopped")
 
 # ─── STATUS ───────────────────────────────────────────────────
 
@@ -409,6 +643,74 @@ async def kill_switch():
         logger.error(f"Kill switch error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ─── SCHEDULER MANAGEMENT ────────────────────────────────────
+
+@app.get("/api/scheduler/status")
+async def get_scheduler_status():
+    """Get scheduler state, signal history and next run times"""
+    jobs = []
+    for job in scheduler.get_jobs():
+        jobs.append({
+            "id":       job.id,
+            "name":     job.name,
+            "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+            "paused":   job.next_run_time is None,
+        })
+    return {
+        "running":            scheduler_state["running"],
+        "paused":             scheduler_state["paused"],
+        "error_count":        scheduler_state["error_count"],
+        "last_run":           scheduler_state["last_run"],
+        "last_error":         scheduler_state["last_error"],
+        "last_signal_check":  scheduler_state["last_signal_check"],
+        "current_signals":    scheduler_state["signal_history"],
+        "jobs":               jobs,
+        "timestamp":          datetime.now(ET).isoformat(),
+    }
+
+@app.post("/api/scheduler/check-signals")
+async def check_signals_now():
+    """Manually trigger a signal check immediately"""
+    await run_in_threadpool(_signal_monitor)
+    return {
+        "status":          "checked",
+        "current_signals": scheduler_state["signal_history"],
+        "timestamp":       datetime.now(ET).isoformat(),
+    }
+
+@app.post("/api/scheduler/pause")
+async def pause_scheduler():
+    """Pause all scheduled jobs"""
+    scheduler_state["paused"] = True
+    for job in scheduler.get_jobs():
+        job.pause()
+    logger.warning("⏸️  Scheduler paused manually")
+    return {"status": "paused"}
+
+@app.post("/api/scheduler/resume")
+async def resume_scheduler():
+    """Resume all scheduled jobs and clear error state"""
+    scheduler_state["paused"] = False
+    scheduler_state["error_count"] = 0
+    scheduler_state["last_error"] = {}
+    for job in scheduler.get_jobs():
+        job.resume()
+    logger.info("▶️  Scheduler resumed")
+    return {"status": "resumed"}
+
+@app.post("/api/scheduler/run/{strategy}")
+async def trigger_scheduled_strategy(strategy: str):
+    """Manually trigger a scheduled strategy immediately"""
+    valid = ["macro_regime", "crypto_trend", "thematic_rotation"]
+    if strategy not in valid:
+        raise HTTPException(status_code=400, detail=f"Unknown strategy. Valid: {valid}")
+    await run_in_threadpool(_run_scheduled_strategy, strategy)
+    return {
+        "status":    "triggered",
+        "strategy":  strategy,
+        "timestamp": datetime.now(ET).isoformat(),
+    }
+
 # ─── MAIN ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -417,6 +719,5 @@ if __name__ == "__main__":
         "api:app",
         host="0.0.0.0",
         port=8000,
-        reload=False,   # ← change this
-        workers=1       # ← add this
+        reload=True
     )
