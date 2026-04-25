@@ -4,7 +4,7 @@ import threading
 import math
 from dotenv import load_dotenv
 from loguru import logger
-from ib_insync import IB, Stock, Index, MarketOrder, LimitOrder
+from ib_insync import IB, Stock, Index, Crypto, MarketOrder, LimitOrder
 
 load_dotenv()
 
@@ -37,13 +37,16 @@ class IBKRClient:
         )
         self._thread.start()
 
-        # Crypto ETF proxies for paper trading
-        # BITO = ProShares Bitcoin Strategy ETF
-        # ETHE = Grayscale Ethereum Trust
+        # Crypto native contracts — PAXOS exchange, 24/7 trading
+        # Falls back to ETF proxies if PAXOS not available on account
+        self.CRYPTO_NATIVE = {"BTC", "ETH"}
+        self.CRYPTO_EXCHANGE = os.getenv("CRYPTO_EXCHANGE", "PAXOS")  # PAXOS or ZEROHASH
+
+        # ETF proxies fallback (used if USE_CRYPTO_PROXY=true in .env)
+        self.USE_CRYPTO_PROXY = os.getenv("USE_CRYPTO_PROXY", "false").lower() == "true"
         self.CRYPTO_PROXY = {
             "BTC": "BITO",
             "ETH": "ETHE",
-            "SOL": "BITO",
         }
 
         # Hardcoded conids
@@ -59,6 +62,11 @@ class IBKRClient:
             "BITO": 485478546,
             "ETHE": 532641611,
             "VIX":  13455763,
+            # Crypto conIds vary by exchange
+            "BTC_PAXOS":     479624278,
+            "ETH_PAXOS":     532640249,
+            "BTC_ZEROHASH":  541686651,
+            "ETH_ZEROHASH":  541686654,
         }
         logger.info(f"IBKR TWS Client initialized — Paper: {self.paper}")
 
@@ -155,18 +163,45 @@ class IBKRClient:
 
     async def _get_contract(self, symbol):
         try:
-            # Remap crypto to ETF proxies for paper trading
-            resolved = self.CRYPTO_PROXY.get(symbol, symbol)
-            if resolved != symbol:
+            # Native crypto contracts
+            if symbol in self.CRYPTO_NATIVE and not self.USE_CRYPTO_PROXY:
+                exchange = self.CRYPTO_EXCHANGE
+                contract = Crypto(symbol, exchange, "USD")
+                logger.info(f"Crypto contract: {symbol} on {exchange}")
+                await self.ib.qualifyContractsAsync(contract)
+                return contract
+
+            # ETF proxy fallback
+            if symbol in self.CRYPTO_PROXY and self.USE_CRYPTO_PROXY:
+                resolved = self.CRYPTO_PROXY[symbol]
                 logger.info(f"Crypto proxy: {symbol} -> {resolved}")
-            if resolved == "VIX":
-                contract = Index("VIX", "CBOE")
-            else:
                 contract = Stock(resolved, "SMART", "USD")
+                await self.ib.qualifyContractsAsync(contract)
+                return contract
+
+            # VIX index
+            if symbol == "VIX":
+                contract = Index("VIX", "CBOE")
+                await self.ib.qualifyContractsAsync(contract)
+                return contract
+
+            # Standard stock/ETF
+            contract = Stock(symbol, "SMART", "USD")
             await self.ib.qualifyContractsAsync(contract)
             return contract
+
         except Exception as e:
             logger.error(f"Failed to get contract for {symbol}: {e}")
+            # If native crypto fails, try ETF proxy as fallback
+            if symbol in self.CRYPTO_NATIVE:
+                logger.warning(f"Native crypto failed for {symbol}, falling back to ETF proxy")
+                try:
+                    resolved = self.CRYPTO_PROXY.get(symbol, symbol)
+                    contract = Stock(resolved, "SMART", "USD")
+                    await self.ib.qualifyContractsAsync(contract)
+                    return contract
+                except Exception as e2:
+                    logger.error(f"ETF proxy fallback also failed for {symbol}: {e2}")
             return None
 
     def get_price(self, symbol):
@@ -208,13 +243,18 @@ class IBKRClient:
             duration = duration_map.get(period, "1 M")
             bar_size = bar_map.get(bar, "1 day")
 
+            # Crypto uses MIDPOINT and trades 24/7 (useRTH=False)
+            is_crypto = symbol in self.CRYPTO_NATIVE
+            what_to_show = "MIDPOINT" if is_crypto else "TRADES"
+            use_rth = False if is_crypto else True
+
             bars = await self.ib.reqHistoricalDataAsync(
                 contract,
                 endDateTime="",
                 durationStr=duration,
                 barSizeSetting=bar_size,
-                whatToShow="TRADES",
-                useRTH=True
+                whatToShow=what_to_show,
+                useRTH=use_rth
             )
 
             if not bars:
