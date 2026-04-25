@@ -173,9 +173,13 @@ class MacroRegimeStrategy:
             regime = self.get_regime(vix, spy_data)
             target_etfs = self.get_target_etfs(regime)
 
-            # Get current positions
+            # Get current positions AND pending orders
             positions = self.client.get_positions()
             current_symbols = [p.get("ticker") for p in positions]
+            pending_symbols = self.client.get_open_order_symbols()
+            active_symbols = set(current_symbols) | pending_symbols
+            logger.info(f"Current positions: {current_symbols}")
+            logger.info(f"Pending orders: {pending_symbols}")
 
             # Close positions not in target
             for symbol in current_symbols:
@@ -188,7 +192,7 @@ class MacroRegimeStrategy:
             per_etf = allocation / len(target_etfs)
 
             for symbol in target_etfs:
-                if symbol not in current_symbols:
+                if symbol not in active_symbols:
                     data = self.client.get_historical_data(symbol, period="3M", bar="1d")
                     if not self.check_liquidity(symbol, data):
                         continue

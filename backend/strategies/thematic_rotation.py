@@ -233,9 +233,12 @@ class ThematicRotationStrategy:
         # 25% of portfolio allocated to thematic
         allocation = portfolio_value * 0.25
 
-        # Get current positions
+        # Get current positions AND pending orders
         positions       = self.client.get_positions()
         current_symbols = [p.get("ticker") for p in positions]
+        pending_symbols = self.client.get_open_order_symbols()
+        active_symbols  = set(current_symbols) | pending_symbols
+        logger.info(f"Thematic positions: {current_symbols}, pending: {pending_symbols}")
 
         # Check broad market regime
         broad_bear = self.detect_broad_bear()
@@ -254,7 +257,7 @@ class ThematicRotationStrategy:
             # Buy defensive
             per_etf = allocation / len(self.DEFENSIVE)
             for symbol in self.DEFENSIVE:
-                if symbol not in current_symbols:
+                if symbol not in active_symbols:
                     data   = self.client.get_historical_data(
                         symbol, period="3M", bar="1d"
                     )
@@ -300,7 +303,7 @@ class ThematicRotationStrategy:
                 if not self.check_liquidity(symbol, data):
                     continue
 
-                if symbol not in current_symbols:
+                if symbol not in active_symbols:
                     shares = self.calculate_position_size(
                         symbol, per_etf, data
                     )

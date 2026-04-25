@@ -330,6 +330,36 @@ class IBKRClient:
             logger.error(f"Failed to get positions: {e}")
             return []
 
+    def get_open_orders(self):
+        """Get all pending/open orders — symbols with active unfilled orders"""
+        return self._run(self._get_open_orders())
+
+    async def _get_open_orders(self):
+        try:
+            trades = self.ib.openTrades()
+            result = []
+            for trade in trades:
+                status = trade.orderStatus.status
+                # Only include active pending orders
+                if status in ("PendingSubmit", "PreSubmitted", "Submitted"):
+                    result.append({
+                        "symbol":   trade.contract.symbol,
+                        "side":     trade.order.action,
+                        "quantity": trade.order.totalQuantity,
+                        "status":   status,
+                        "orderId":  trade.order.orderId,
+                    })
+            logger.info(f"Open orders: {[o['symbol'] for o in result]}")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to get open orders: {e}")
+            return []
+
+    def get_open_order_symbols(self):
+        """Return set of symbols that already have pending orders"""
+        orders = self.get_open_orders()
+        return {o["symbol"] for o in orders}
+
     def close_position(self, symbol):
         return self._run(self._close_position(symbol))
 

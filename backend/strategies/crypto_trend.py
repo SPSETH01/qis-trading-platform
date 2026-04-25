@@ -154,9 +154,12 @@ class CryptoTrendStrategy:
         allocation  = portfolio_value * 0.35
         per_coin    = allocation / len(self.CRYPTO)
 
-        # Get current positions
+        # Get current positions AND pending orders
         positions       = self.client.get_positions()
         current_symbols = [p.get("ticker") for p in positions]
+        pending_symbols = self.client.get_open_order_symbols()
+        active_symbols  = set(current_symbols) | pending_symbols
+        logger.info(f"Crypto positions: {current_symbols}, pending: {pending_symbols}")
 
         bear_count = 0  # track how many coins are bearish
 
@@ -179,7 +182,7 @@ class CryptoTrendStrategy:
 
                 # ── Execute based on signal
                 if signal == "BULL":
-                    if symbol not in current_symbols:
+                    if symbol not in active_symbols:
                         quantity = self.calculate_position_size(
                             symbol, per_coin, data
                         )
@@ -222,7 +225,7 @@ class CryptoTrendStrategy:
                 biti_quantity   = self.calculate_position_size(
                     self.INVERSE, biti_allocation, biti_data
                 )
-                if biti_quantity > 0 and self.INVERSE not in current_symbols:
+                if biti_quantity > 0 and self.INVERSE not in active_symbols:
                     self.client.place_order(self.INVERSE, "BUY", biti_quantity)
                     results.append({
                         "symbol": self.INVERSE,
