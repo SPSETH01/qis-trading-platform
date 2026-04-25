@@ -2,7 +2,6 @@ import os
 import asyncio
 import threading
 import math
-from concurrent.futures import Future
 from dotenv import load_dotenv
 from loguru import logger
 from ib_insync import IB, Stock, Index, MarketOrder, LimitOrder
@@ -251,6 +250,9 @@ class IBKRClient:
                 order = MarketOrder(side.upper(), quantity)
             else:
                 order = LimitOrder(side.upper(), quantity, 0)
+
+            # Queue outside regular trading hours — fills at next market open
+            order.outsideRth = True
 
             trade = self.ib.placeOrder(contract, order)
             await asyncio.sleep(1)
