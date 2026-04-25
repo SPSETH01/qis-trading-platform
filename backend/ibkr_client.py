@@ -5,6 +5,7 @@ import math
 from dotenv import load_dotenv
 from loguru import logger
 from ib_insync import IB, Stock, Index, Crypto, MarketOrder, LimitOrder
+import yfinance as yf
 
 load_dotenv()
 
@@ -68,6 +69,11 @@ class IBKRClient:
             "BTC_ZEROHASH":  541686651,
             "ETH_ZEROHASH":  541686654,
         }
+        # Yahoo Finance fallback for symbols with no IBKR market data subscription
+        self.YAHOO_FALLBACK = {
+            "VIX": "^VIX",
+        }
+
         logger.info(f"IBKR TWS Client initialized — Paper: {self.paper}")
 
     # ─── PRIVATE: EVENT LOOP THREAD ───────────────────────────
@@ -211,17 +217,43 @@ class IBKRClient:
         try:
             contract = await self._get_contract(symbol)
             if not contract:
-                return None
+                return self._get_price_yahoo(symbol)
             ticker = self.ib.reqMktData(contract, "", False, False)
             await asyncio.sleep(2)
             price = ticker.last if ticker.last and not math.isnan(ticker.last) else None
             if price is None:
                 price = ticker.close if ticker.close and not math.isnan(ticker.close) else None
+
+            # Fall back to Yahoo Finance if IBKR returns no price
+            if price is None:
+                logger.warning(f"{symbol}: no price from IBKR — trying Yahoo Finance")
+                price = self._get_price_yahoo(symbol)
+
             logger.info(f"{symbol} price: ${price}")
             return float(price) if price else None
         except Exception as e:
             logger.error(f"Failed to get price for {symbol}: {e}")
-            return None
+            return self._get_price_yahoo(symbol)
+
+    def _get_price_yahoo(self, symbol):
+        """Fetch current price from Yahoo Finance — used as fallback"""
+        yahoo_symbol = self.YAHOO_FALLBACK.get(symbol, symbol)
+        try:
+            ticker = yf.Ticker(yahoo_symbol)
+            data   = ticker.fast_info
+            price  = data.last_price
+            if price and not math.isnan(price):
+                logger.info(f"{symbol} price (Yahoo): ${price:.2f}")
+                return float(price)
+            # Try history as second fallback
+            hist = ticker.history(period="1d")
+            if not hist.empty:
+                price = float(hist["Close"].iloc[-1])
+                logger.info(f"{symbol} price (Yahoo history): ${price:.2f}")
+                return price
+        except Exception as e:
+            logger.error(f"Yahoo Finance fallback failed for {symbol}: {e}")
+        return None
 
     def get_historical_data(self, symbol, period="1M", bar="1d"):
         return self._run(self._get_historical_data(symbol, period, bar))
