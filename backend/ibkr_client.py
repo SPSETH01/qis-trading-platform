@@ -1,29 +1,51 @@
 import os
 import asyncio
-import sys
+import threading
+import math
+from concurrent.futures import Future
 from dotenv import load_dotenv
 from loguru import logger
-from ib_insync import *
-
-# Fix for Python 3.14 event loop
-try:
-    loop = asyncio.get_event_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+from ib_insync import IB, Stock, Index, MarketOrder, LimitOrder
 
 load_dotenv()
 
-class IBKRClient:
-    def __init__(self):
-        self.paper = os.getenv("IBKR_PAPER", "true").lower() == "true"
-        self.account_id = os.getenv("IBKR_ACCOUNT_ID", "U25402501")
-        self.host = "127.0.0.1"
-        self.port = int(os.getenv("TWS_PORT", 7497))
-        self.client_id = 1
 
-        # ib_insync client
+class IBKRClient:
+    """
+    IBKR TWS client that runs ib_insync in a dedicated background thread
+    with its own event loop — completely isolated from FastAPI's event loop.
+
+    All public methods are synchronous and safe to call from any thread,
+    including FastAPI route handlers and threadpool workers.
+    """
+
+    def __init__(self):
+        self.paper      = os.getenv("IBKR_PAPER", "true").lower() == "true"
+        self.account_id = os.getenv("IBKR_ACCOUNT_ID", "DU25402501")
+        self.host       = "127.0.0.1"
+        self.port       = int(os.getenv("TWS_PORT", 7497))
+        self.client_id  = 1
+
+        # ib_insync instance — only touched from _tws_thread
         self.ib = IB()
+
+        # Dedicated event loop + thread for all TWS calls
+        self._loop   = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="tws-event-loop",
+            daemon=True
+        )
+        self._thread.start()
+
+        # Crypto ETF proxies for paper trading
+        # BITO = ProShares Bitcoin Strategy ETF
+        # ETHE = Grayscale Ethereum Trust
+        self.CRYPTO_PROXY = {
+            "BTC": "BITO",
+            "ETH": "ETHE",
+            "SOL": "BITO",
+        }
 
         # Hardcoded conids
         self.CONIDS = {
@@ -35,23 +57,42 @@ class IBKRClient:
             "SDS":  828937764,
             "BOTZ": 247691382,
             "BLOK": 302902491,
-            "BTC":  541686651,
-            "ETH":  541686654,
+            "BITO": 485478546,
+            "ETHE": 532641611,
             "VIX":  13455763,
         }
         logger.info(f"IBKR TWS Client initialized — Paper: {self.paper}")
 
+    # ─── PRIVATE: EVENT LOOP THREAD ───────────────────────────
+
+    def _run_loop(self):
+        """Run the dedicated asyncio event loop forever in background thread"""
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def _run(self, coro):
+        """
+        Submit a coroutine to the TWS event loop and block until result.
+        Safe to call from any thread including FastAPI workers.
+        """
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=30)
+
     # ─── CONNECTION ────────────────────────────────────────────
 
     def connect(self):
-        """Connect to TWS"""
+        """Connect to TWS — blocks until connected or timeout"""
+        return self._run(self._connect())
+
+    async def _connect(self):
         try:
-            logger.info(f"Attempting TWS connection on {self.host}:{self.port} clientId:{self.client_id}")
-            import nest_asyncio
-            nest_asyncio.apply()
-            self.ib.connect(
-                self.host, 
-                self.port, 
+            logger.info(
+                f"Attempting TWS connection on {self.host}:{self.port} "
+                f"clientId:{self.client_id}"
+            )
+            await self.ib.connectAsync(
+                self.host,
+                self.port,
                 clientId=self.client_id,
                 timeout=10
             )
@@ -62,16 +103,17 @@ class IBKRClient:
             return False
 
     def disconnect(self):
-        """Disconnect from TWS"""
+        self._run(self._disconnect())
+
+    async def _disconnect(self):
         self.ib.disconnect()
         logger.info("Disconnected from TWS")
 
     def check_connection(self):
-        """Check if connected to TWS"""
         try:
-            if not self.ib.isConnected():
-                self.connect()
             connected = self.ib.isConnected()
+            if not connected:
+                connected = self.connect()
             logger.info(f"TWS Connection: {'✅ Connected' if connected else '❌ Disconnected'}")
             return connected
         except Exception as e:
@@ -81,10 +123,10 @@ class IBKRClient:
     # ─── ACCOUNT ───────────────────────────────────────────────
 
     def get_account(self):
-        """Get account details"""
+        return self._run(self._get_account())
+
+    async def _get_account(self):
         try:
-            if not self.ib.isConnected():
-                self.connect()
             accounts = self.ib.managedAccounts()
             return [{"id": acc} for acc in accounts]
         except Exception as e:
@@ -92,10 +134,10 @@ class IBKRClient:
             return None
 
     def get_portfolio_value(self):
-        """Get total portfolio value"""
+        return self._run(self._get_portfolio_value())
+
+    async def _get_portfolio_value(self):
         try:
-            if not self.ib.isConnected():
-                self.connect()
             account_values = self.ib.accountValues(self.account_id)
             for av in account_values:
                 if av.tag == "NetLiquidation" and av.currency == "USD":
@@ -110,37 +152,37 @@ class IBKRClient:
     # ─── MARKET DATA ───────────────────────────────────────────
 
     def get_contract(self, symbol):
-        """Get IBKR contract for a symbol"""
+        return self._run(self._get_contract(symbol))
+
+    async def _get_contract(self, symbol):
         try:
-            if symbol in ["BTC", "ETH", "SOL"]:
-                contract = Crypto(symbol, "PAXOS", "USD")
-            elif symbol == "VIX":
+            # Remap crypto to ETF proxies for paper trading
+            resolved = self.CRYPTO_PROXY.get(symbol, symbol)
+            if resolved != symbol:
+                logger.info(f"Crypto proxy: {symbol} -> {resolved}")
+            if resolved == "VIX":
                 contract = Index("VIX", "CBOE")
             else:
-                contract = Stock(symbol, "SMART", "USD")
-            self.ib.qualifyContracts(contract)
+                contract = Stock(resolved, "SMART", "USD")
+            await self.ib.qualifyContractsAsync(contract)
             return contract
         except Exception as e:
             logger.error(f"Failed to get contract for {symbol}: {e}")
             return None
 
-    def get_conid(self, symbol):
-        """Get contract ID for symbol"""
-        if symbol in self.CONIDS:
-            return self.CONIDS[symbol]
-        return None
-
     def get_price(self, symbol):
-        """Get current price for a symbol"""
+        return self._run(self._get_price(symbol))
+
+    async def _get_price(self, symbol):
         try:
-            if not self.ib.isConnected():
-                self.connect()
-            contract = self.get_contract(symbol)
+            contract = await self._get_contract(symbol)
             if not contract:
                 return None
             ticker = self.ib.reqMktData(contract, "", False, False)
-            self.ib.sleep(2)
-            price = ticker.last or ticker.close
+            await asyncio.sleep(2)
+            price = ticker.last if ticker.last and not math.isnan(ticker.last) else None
+            if price is None:
+                price = ticker.close if ticker.close and not math.isnan(ticker.close) else None
             logger.info(f"{symbol} price: ${price}")
             return float(price) if price else None
         except Exception as e:
@@ -148,11 +190,11 @@ class IBKRClient:
             return None
 
     def get_historical_data(self, symbol, period="1M", bar="1d"):
-        """Get historical OHLCV data"""
+        return self._run(self._get_historical_data(symbol, period, bar))
+
+    async def _get_historical_data(self, symbol, period="1M", bar="1d"):
         try:
-            if not self.ib.isConnected():
-                self.connect()
-            contract = self.get_contract(symbol)
+            contract = await self._get_contract(symbol)
             if not contract:
                 return None
 
@@ -167,7 +209,7 @@ class IBKRClient:
             duration = duration_map.get(period, "1 M")
             bar_size = bar_map.get(bar, "1 day")
 
-            bars = self.ib.reqHistoricalData(
+            bars = await self.ib.reqHistoricalDataAsync(
                 contract,
                 endDateTime="",
                 durationStr=duration,
@@ -179,16 +221,16 @@ class IBKRClient:
             if not bars:
                 return None
 
-            data = []
-            for bar in bars:
-                data.append({
-                    "open":   bar.open,
-                    "high":   bar.high,
-                    "low":    bar.low,
-                    "close":  bar.close,
-                    "volume": bar.volume
-                })
-            return data
+            return [
+                {
+                    "open":   b.open,
+                    "high":   b.high,
+                    "low":    b.low,
+                    "close":  b.close,
+                    "volume": b.volume
+                }
+                for b in bars
+            ]
 
         except Exception as e:
             logger.error(f"Failed to get historical data for {symbol}: {e}")
@@ -197,11 +239,11 @@ class IBKRClient:
     # ─── ORDERS ────────────────────────────────────────────────
 
     def place_order(self, symbol, side, quantity, order_type="MKT"):
-        """Place a trade order"""
+        return self._run(self._place_order(symbol, side, quantity, order_type))
+
+    async def _place_order(self, symbol, side, quantity, order_type="MKT"):
         try:
-            if not self.ib.isConnected():
-                self.connect()
-            contract = self.get_contract(symbol)
+            contract = await self._get_contract(symbol)
             if not contract:
                 return None
 
@@ -211,23 +253,27 @@ class IBKRClient:
                 order = LimitOrder(side.upper(), quantity, 0)
 
             trade = self.ib.placeOrder(contract, order)
-            self.ib.sleep(1)
-            logger.info(f"Order placed: {side} {quantity} {symbol} → {trade.orderStatus.status}")
-            return {"status": trade.orderStatus.status, "orderId": trade.order.orderId}
-
+            await asyncio.sleep(1)
+            logger.info(
+                f"Order placed: {side} {quantity} {symbol} "
+                f"→ {trade.orderStatus.status}"
+            )
+            return {
+                "status":  trade.orderStatus.status,
+                "orderId": trade.order.orderId
+            }
         except Exception as e:
             logger.error(f"Failed to place order: {e}")
             return None
 
     def get_positions(self):
-        """Get current open positions"""
+        return self._run(self._get_positions())
+
+    async def _get_positions(self):
         try:
-            if not self.ib.isConnected():
-                self.connect()
             positions = self.ib.positions(self.account_id)
-            result = []
-            for pos in positions:
-                result.append({
+            return [
+                {
                     "ticker":        pos.contract.symbol,
                     "position":      pos.position,
                     "avgCost":       pos.avgCost,
@@ -235,21 +281,24 @@ class IBKRClient:
                     "unrealizedPnl": 0,
                     "realizedPnl":   0,
                     "currency":      pos.contract.currency
-                })
-            return result
+                }
+                for pos in positions
+            ]
         except Exception as e:
             logger.error(f"Failed to get positions: {e}")
             return []
 
     def close_position(self, symbol):
-        """Close an open position"""
+        return self._run(self._close_position(symbol))
+
+    async def _close_position(self, symbol):
         try:
-            positions = self.get_positions()
+            positions = await self._get_positions()
             for pos in positions:
                 if pos.get("ticker") == symbol:
                     quantity = abs(pos.get("position", 0))
-                    side = "SELL" if pos.get("position", 0) > 0 else "BUY"
-                    return self.place_order(symbol, side, quantity)
+                    side     = "SELL" if pos.get("position", 0) > 0 else "BUY"
+                    return await self._place_order(symbol, side, quantity)
             logger.warning(f"No open position found for {symbol}")
             return None
         except Exception as e:
@@ -257,11 +306,13 @@ class IBKRClient:
             return None
 
     def close_all_positions(self):
-        """Emergency — close all positions (kill switch)"""
+        return self._run(self._close_all_positions())
+
+    async def _close_all_positions(self):
         logger.warning("⚠️  KILL SWITCH ACTIVATED — closing all positions")
-        positions = self.get_positions()
+        positions = await self._get_positions()
         for pos in positions:
             symbol = pos.get("ticker")
             if symbol:
-                self.close_position(symbol)
+                await self._close_position(symbol)
                 logger.info(f"Closed position: {symbol}")
