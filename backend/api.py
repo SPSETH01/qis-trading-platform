@@ -1,3 +1,16 @@
+import asyncio
+import sys
+
+# Fix for Python 3.14 event loop
+if sys.version_info >= (3, 10):
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+
 import os
 import sys
 from datetime import datetime
@@ -47,6 +60,103 @@ def get_status():
         "account_id":   os.getenv("IBKR_ACCOUNT_ID"),
         "timestamp":    datetime.now().isoformat(),
     }
+
+@app.get("/api/auth/init")
+def init_auth():
+    """Initialise brokerage session after gateway login"""
+    try:
+        # Step 1 — tickle
+        client.session.post(
+            f"{client.base_url}/tickle",
+            verify=False,
+            timeout=10
+        )
+        # Step 2 — init SSO session
+        response = client.session.get(
+            f"{client.base_url}/iserver/auth/ssodh/init?publish=true&compete=true",
+            verify=False,
+            timeout=10
+        )
+        logger.info(f"SSO init response: {response.text}")
+        
+        # Step 3 — check status
+        status = client.check_connection()
+        return {"initialized": True, "connected": status, "response": response.text}
+    except Exception as e:
+        logger.error(f"Auth init error: {e}")
+        return {"initialized": False, "error": str(e)}
+
+
+@app.get("/api/auth/reauth")
+def reauth():
+    """Reauthenticate brokerage session"""
+    try:
+        response = client.session.post(
+            f"{client.base_url}/iserver/reauthenticate",
+            verify=False,
+            timeout=10
+        )
+        logger.info(f"Reauth response: {response.text}")
+        return {"response": response.text, "status": response.status_code}
+    except Exception as e:
+        logger.error(f"Reauth error: {e}")
+        return {"error": str(e)}
+    
+@app.get("/api/auth/debug")
+def debug_auth():
+    """Debug authentication state"""
+    try:
+        results = {}
+        
+        # Test 1 — tickle
+        r1 = client.session.post(f"{client.base_url}/tickle", verify=False, timeout=10)
+        results["tickle"] = {"status": r1.status_code, "response": r1.text[:200]}
+        
+        # Test 2 — auth status
+        r2 = client.session.get(f"{client.base_url}/iserver/auth/status", verify=False, timeout=10)
+        results["auth_status"] = {"status": r2.status_code, "response": r2.text[:200]}
+        
+        # Test 3 — accounts
+        r3 = client.session.get(f"{client.base_url}/portfolio/accounts", verify=False, timeout=10)
+        results["accounts"] = {"status": r3.status_code, "response": r3.text[:200]}
+        
+        return results
+    except Exception as e:
+        return {"error": str(e)}    
+
+@app.get("/api/auth/set-cookie")
+def set_cookie(cookie: str):
+    """Set session cookie from browser"""
+    try:
+        client.session.cookies.set("x-sess-uuid", cookie, domain="localhost")
+        logger.info(f"Cookie set: {cookie[:20]}...")
+        connected = client.check_connection()
+        return {"cookie_set": True, "connected": connected}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/api/auth/set-cookies")
+def set_cookies(xsess: str, jsession: str, xyzab: str):
+    """Set all session cookies from browser"""
+    try:
+        client.session.cookies.clear()
+        client.session.cookies.set("x-sess-uuid", xsess, domain="localhost")
+        client.session.cookies.set("JSESSIONID", jsession, domain="localhost", path="/sso")
+        client.session.cookies.set("XYZAB", xyzab, domain="localhost")
+        connected = client.check_connection()
+        return {"cookies_set": True, "connected": connected}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/api/auth/connect")
+def connect_tws():
+    """Connect to TWS"""
+    try:
+        result = client.connect()
+        return {"connected": result}
+    except Exception as e:
+        return {"error": str(e)}
+
 
 @app.get("/api/portfolio")
 def get_portfolio():

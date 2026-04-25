@@ -1,90 +1,92 @@
 import os
-import urllib3
-import requests
+import asyncio
+import sys
 from dotenv import load_dotenv
 from loguru import logger
+from ib_insync import *
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Fix for Python 3.14 event loop
+try:
+    loop = asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
 load_dotenv()
 
 class IBKRClient:
     def __init__(self):
-        self.base_url = os.getenv("IBKR_BASE_URL", "https://localhost:5001/v1/api")
         self.paper = os.getenv("IBKR_PAPER", "true").lower() == "true"
         self.account_id = os.getenv("IBKR_ACCOUNT_ID", "U25402501")
-        self.session = requests.Session()
-        self.session.verify = False
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-        })
+        self.host = "127.0.0.1"
+        self.port = int(os.getenv("TWS_PORT", 7497))
+        self.client_id = 1
 
-        # Hardcoded conids for fast lookup
+        # ib_insync client
+        self.ib = IB()
+
+        # Hardcoded conids
         self.CONIDS = {
-            "SPY":  "756733",
-            "QQQ":  "320227571",
-            "GLD":  "51529211",
-            "TLT":  "15547841",
-            "SH":   "738523410",
-            "SDS":  "828937764",
-            "BOTZ": "247691382",
-            "BLOK": "302902491",
-            "BTC":  "541686651",
-            "ETH":  "541686654",
-            "VIX":  "13455763",
+            "SPY":  756733,
+            "QQQ":  320227571,
+            "GLD":  51529211,
+            "TLT":  15547841,
+            "SH":   738523410,
+            "SDS":  828937764,
+            "BOTZ": 247691382,
+            "BLOK": 302902491,
+            "BTC":  541686651,
+            "ETH":  541686654,
+            "VIX":  13455763,
         }
-        logger.info(f"IBKR Client initialized — Paper: {self.paper}")
+        logger.info(f"IBKR TWS Client initialized — Paper: {self.paper}")
 
     # ─── CONNECTION ────────────────────────────────────────────
 
-    def check_connection(self):
-        """Check if IBKR gateway is running"""
+    def connect(self):
+        """Connect to TWS"""
         try:
-            # First tickle to wake up session
-            self.session.post(
-                f"{self.base_url}/tickle",
-                verify=False,
+            logger.info(f"Attempting TWS connection on {self.host}:{self.port} clientId:{self.client_id}")
+            import nest_asyncio
+            nest_asyncio.apply()
+            self.ib.connect(
+                self.host, 
+                self.port, 
+                clientId=self.client_id,
                 timeout=10
             )
-            # Then check auth status
-            response = self.session.get(
-                f"{self.base_url}/iserver/auth/status",
-                verify=False,
-                timeout=10
-            )
-            if response.status_code == 200 and response.text.strip():
-                data = response.json()
-                connected = data.get("authenticated", False)
-                logger.info(f"IBKR Connection: {'✅ Connected' if connected else '❌ Disconnected'}")
-                return connected
-            return False
+            logger.info(f"✅ Connected to TWS on port {self.port}")
+            return True
         except Exception as e:
-            logger.error(f"IBKR Connection failed: {e}")
+            logger.error(f"TWS Connection failed: {e}")
             return False
 
-    def tickle(self):
-        """Keep session alive"""
+    def disconnect(self):
+        """Disconnect from TWS"""
+        self.ib.disconnect()
+        logger.info("Disconnected from TWS")
+
+    def check_connection(self):
+        """Check if connected to TWS"""
         try:
-            response = self.session.post(
-                f"{self.base_url}/tickle",
-                verify=False,
-                timeout=10
-            )
-            return response.json()
+            if not self.ib.isConnected():
+                self.connect()
+            connected = self.ib.isConnected()
+            logger.info(f"TWS Connection: {'✅ Connected' if connected else '❌ Disconnected'}")
+            return connected
         except Exception as e:
-            logger.error(f"Tickle failed: {e}")
-            return None
+            logger.error(f"Connection check failed: {e}")
+            return False
+
+    # ─── ACCOUNT ───────────────────────────────────────────────
 
     def get_account(self):
         """Get account details"""
         try:
-            response = self.session.get(
-                f"{self.base_url}/portfolio/accounts",
-                verify=False,
-                timeout=10
-            )
-            return response.json()
+            if not self.ib.isConnected():
+                self.connect()
+            accounts = self.ib.managedAccounts()
+            return [{"id": acc} for acc in accounts]
         except Exception as e:
             logger.error(f"Failed to get account: {e}")
             return None
@@ -92,77 +94,102 @@ class IBKRClient:
     def get_portfolio_value(self):
         """Get total portfolio value"""
         try:
-            response = self.session.get(
-                f"{self.base_url}/portfolio/{self.account_id}/summary",
-                verify=False,
-                timeout=10
-            )
-            data = response.json()
-            value = data.get("netliquidation", {}).get("amount", 500)
-            logger.info(f"Portfolio value: ${value:,.2f}")
-            return float(value)
+            if not self.ib.isConnected():
+                self.connect()
+            account_values = self.ib.accountValues(self.account_id)
+            for av in account_values:
+                if av.tag == "NetLiquidation" and av.currency == "USD":
+                    value = float(av.value)
+                    logger.info(f"Portfolio value: ${value:,.2f}")
+                    return value
+            return float(os.getenv("STARTING_CAPITAL", 500))
         except Exception as e:
             logger.error(f"Failed to get portfolio value: {e}")
             return float(os.getenv("STARTING_CAPITAL", 500))
 
     # ─── MARKET DATA ───────────────────────────────────────────
 
-    def get_price(self, symbol):
-        """Get current price for a symbol"""
+    def get_contract(self, symbol):
+        """Get IBKR contract for a symbol"""
         try:
-            conid = self.get_conid(symbol)
-            if not conid:
-                return None
-            response = self.session.get(
-                f"{self.base_url}/iserver/marketdata/snapshot",
-                params={"conids": conid, "fields": "31,84,86"},
-                verify=False,
-                timeout=10
-            )
-            data = response.json()
-            if data:
-                price = data[0].get("31")
-                logger.info(f"{symbol} price: ${price}")
-                return float(price) if price else None
+            if symbol in ["BTC", "ETH", "SOL"]:
+                contract = Crypto(symbol, "PAXOS", "USD")
+            elif symbol == "VIX":
+                contract = Index("VIX", "CBOE")
+            else:
+                contract = Stock(symbol, "SMART", "USD")
+            self.ib.qualifyContracts(contract)
+            return contract
         except Exception as e:
-            logger.error(f"Failed to get price for {symbol}: {e}")
+            logger.error(f"Failed to get contract for {symbol}: {e}")
             return None
 
     def get_conid(self, symbol):
-        """Get IBKR contract ID for a symbol"""
-        # Check hardcoded map first
-        if symbol in self.CONIDS and self.CONIDS[symbol]:
+        """Get contract ID for symbol"""
+        if symbol in self.CONIDS:
             return self.CONIDS[symbol]
+        return None
+
+    def get_price(self, symbol):
+        """Get current price for a symbol"""
         try:
-            response = self.session.post(
-                f"{self.base_url}/iserver/secdef/search",
-                json={"symbol": symbol},
-                verify=False,
-                timeout=10
-            )
-            data = response.json()
-            if data:
-                conid = data[0].get("conid")
-                self.CONIDS[symbol] = conid
-                return conid
+            if not self.ib.isConnected():
+                self.connect()
+            contract = self.get_contract(symbol)
+            if not contract:
+                return None
+            ticker = self.ib.reqMktData(contract, "", False, False)
+            self.ib.sleep(2)
+            price = ticker.last or ticker.close
+            logger.info(f"{symbol} price: ${price}")
+            return float(price) if price else None
         except Exception as e:
-            logger.error(f"Failed to get conid for {symbol}: {e}")
+            logger.error(f"Failed to get price for {symbol}: {e}")
             return None
 
     def get_historical_data(self, symbol, period="1M", bar="1d"):
         """Get historical OHLCV data"""
         try:
-            conid = self.get_conid(symbol)
-            if not conid:
+            if not self.ib.isConnected():
+                self.connect()
+            contract = self.get_contract(symbol)
+            if not contract:
                 return None
-            response = self.session.get(
-                f"{self.base_url}/iserver/marketdata/history",
-                params={"conid": conid, "period": period, "bar": bar},
-                verify=False,
-                timeout=10
+
+            duration_map = {
+                "1M": "1 M", "3M": "3 M", "6M": "6 M",
+                "1Y": "1 Y", "2Y": "2 Y"
+            }
+            bar_map = {
+                "1d": "1 day", "1h": "1 hour",
+                "30m": "30 mins", "15m": "15 mins"
+            }
+            duration = duration_map.get(period, "1 M")
+            bar_size = bar_map.get(bar, "1 day")
+
+            bars = self.ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow="TRADES",
+                useRTH=True
             )
-            data = response.json()
-            return data.get("data", [])
+
+            if not bars:
+                return None
+
+            data = []
+            for bar in bars:
+                data.append({
+                    "open":   bar.open,
+                    "high":   bar.high,
+                    "low":    bar.low,
+                    "close":  bar.close,
+                    "volume": bar.volume
+                })
+            return data
+
         except Exception as e:
             logger.error(f"Failed to get historical data for {symbol}: {e}")
             return None
@@ -172,28 +199,21 @@ class IBKRClient:
     def place_order(self, symbol, side, quantity, order_type="MKT"):
         """Place a trade order"""
         try:
-            conid = self.get_conid(symbol)
-            if not conid:
-                logger.error(f"No conid found for {symbol}")
+            if not self.ib.isConnected():
+                self.connect()
+            contract = self.get_contract(symbol)
+            if not contract:
                 return None
 
-            order = {
-                "conid": conid,
-                "orderType": order_type,
-                "side": side.upper(),
-                "quantity": quantity,
-                "tif": "DAY"
-            }
+            if order_type == "MKT":
+                order = MarketOrder(side.upper(), quantity)
+            else:
+                order = LimitOrder(side.upper(), quantity, 0)
 
-            response = self.session.post(
-                f"{self.base_url}/iserver/account/{self.account_id}/orders",
-                json={"orders": [order]},
-                verify=False,
-                timeout=10
-            )
-            result = response.json()
-            logger.info(f"Order placed: {side} {quantity} {symbol} → {result}")
-            return result
+            trade = self.ib.placeOrder(contract, order)
+            self.ib.sleep(1)
+            logger.info(f"Order placed: {side} {quantity} {symbol} → {trade.orderStatus.status}")
+            return {"status": trade.orderStatus.status, "orderId": trade.order.orderId}
 
         except Exception as e:
             logger.error(f"Failed to place order: {e}")
@@ -202,12 +222,21 @@ class IBKRClient:
     def get_positions(self):
         """Get current open positions"""
         try:
-            response = self.session.get(
-                f"{self.base_url}/portfolio/{self.account_id}/positions/0",
-                verify=False,
-                timeout=10
-            )
-            return response.json()
+            if not self.ib.isConnected():
+                self.connect()
+            positions = self.ib.positions(self.account_id)
+            result = []
+            for pos in positions:
+                result.append({
+                    "ticker":        pos.contract.symbol,
+                    "position":      pos.position,
+                    "avgCost":       pos.avgCost,
+                    "mktValue":      pos.position * pos.avgCost,
+                    "unrealizedPnl": 0,
+                    "realizedPnl":   0,
+                    "currency":      pos.contract.currency
+                })
+            return result
         except Exception as e:
             logger.error(f"Failed to get positions: {e}")
             return []
@@ -224,7 +253,7 @@ class IBKRClient:
             logger.warning(f"No open position found for {symbol}")
             return None
         except Exception as e:
-            logger.error(f"Failed to close position for {symbol}: {e}")
+            logger.error(f"Failed to close position: {e}")
             return None
 
     def close_all_positions(self):
