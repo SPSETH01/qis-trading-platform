@@ -54,7 +54,14 @@ scheduler_state = {
     "last_error":     {},    # strategy -> last error message
     "error_count":    0,
     "signal_history": {},    # signal_id -> last known value
-    "last_signal_check": None,
+    "last_signal_check":   None,
+    "last_drawdown_check": None,
+    "drawdown_status": {
+        "portfolio_drawdown_pct": 0.0,
+        "kill_switch_fired":      False,
+        "warnings":               [],
+        "position_alerts":        [],
+    },
 }
 
 STRATEGY_MAP = lambda: {
@@ -156,6 +163,92 @@ def _fetch_current_signals():
 
     return signals
 
+# ── Position drawdown thresholds ─────────────────────────────
+PORTFOLIO_KILL_SWITCH  = float(os.getenv("KILL_SWITCH_DRAWDOWN", 0.15))  # 15%
+PORTFOLIO_WARN         = 0.10   # warn at 10%
+POSITION_STOP_LOSS     = 0.20   # close individual position at 20% loss
+
+def _drawdown_monitor():
+    """
+    Runs every 15 minutes.
+    Checks portfolio and position-level drawdown.
+    - Portfolio > 10%  → warning log
+    - Portfolio > 15%  → kill switch, pause all trading
+    - Position  > 20%  → close that position only
+    """
+    if scheduler_state["paused"] and scheduler_state["drawdown_status"]["kill_switch_fired"]:
+        return  # already fired, don't repeat
+
+    try:
+        portfolio_value = client.get_portfolio_value()
+        drawdown_pct    = (peak_value - portfolio_value) / peak_value if peak_value > 0 else 0.0
+        warnings        = []
+        position_alerts = []
+
+        scheduler_state["last_drawdown_check"] = datetime.now(ET).isoformat()
+        scheduler_state["drawdown_status"]["portfolio_drawdown_pct"] = round(drawdown_pct * 100, 2)
+
+        # ── Portfolio level checks ────────────────────────────
+        if drawdown_pct >= PORTFOLIO_KILL_SWITCH:
+            logger.error(
+                f"🚨 KILL SWITCH: portfolio drawdown {drawdown_pct:.1%} "
+                f"exceeds limit {PORTFOLIO_KILL_SWITCH:.0%}"
+            )
+            scheduler_state["drawdown_status"]["kill_switch_fired"] = True
+            scheduler_state["paused"] = True
+            for job in scheduler.get_jobs():
+                job.pause()
+            client.close_all_positions()
+            logger.error("🛑 All positions closed. Resume trading via /api/scheduler/resume")
+            return
+
+        if drawdown_pct >= PORTFOLIO_WARN:
+            msg = f"⚠️  Portfolio drawdown warning: {drawdown_pct:.1%} (limit: {PORTFOLIO_KILL_SWITCH:.0%})"
+            logger.warning(msg)
+            warnings.append(msg)
+
+        # ── Position level checks ─────────────────────────────
+        positions = client.get_positions()
+        for pos in positions:
+            symbol    = pos.get("ticker", "")
+            avg_cost  = pos.get("avgCost", 0)
+            quantity  = pos.get("position", 0)
+            if avg_cost <= 0 or quantity <= 0:
+                continue
+
+            # Get current price
+            current_price = client.get_price(symbol)
+            if not current_price:
+                continue
+
+            pos_drawdown = (avg_cost - current_price) / avg_cost
+            if pos_drawdown >= POSITION_STOP_LOSS:
+                msg = (
+                    f"🔴 Position stop-loss: {symbol} down {pos_drawdown:.1%} "
+                    f"(entry: ${avg_cost:.2f}, current: ${current_price:.2f})"
+                )
+                logger.warning(msg)
+                position_alerts.append(msg)
+                client.close_position(symbol)
+                logger.info(f"Closed {symbol} — stop-loss triggered")
+
+            elif pos_drawdown >= 0.10:
+                msg = f"⚠️  Position warning: {symbol} down {pos_drawdown:.1%}"
+                logger.warning(msg)
+                warnings.append(msg)
+
+        scheduler_state["drawdown_status"]["warnings"]        = warnings
+        scheduler_state["drawdown_status"]["position_alerts"] = position_alerts
+
+        if not warnings and not position_alerts:
+            logger.info(
+                f"✅ Drawdown monitor: portfolio {drawdown_pct:.2%} "
+                f"({len(positions)} positions) — all clear"
+            )
+
+    except Exception as e:
+        logger.error(f"Drawdown monitor error: {e}")
+
 def _signal_monitor():
     """
     Runs every 15 minutes.
@@ -250,10 +343,20 @@ def _setup_scheduler():
         replace_existing=True,
     )
 
+    # ── Drawdown monitor every 15 minutes ────────────────────
+    scheduler.add_job(
+        func=_drawdown_monitor,
+        trigger=IntervalTrigger(minutes=15, timezone=ET),
+        id="drawdown_monitor",
+        name="Drawdown Monitor — every 15min",
+        replace_existing=True,
+    )
+
     scheduler.start()
     scheduler_state["running"] = True
     logger.info("⏰ Scheduler started:")
     logger.info("   signal_monitor    → every 15 minutes (primary)")
+    logger.info("   drawdown_monitor  → every 15 minutes (risk)")
     logger.info("   macro_regime      → weekdays 9:35 AM ET (fallback)")
     logger.info("   crypto_trend      → every 4h (fallback)")
     logger.info("   thematic_rotation → weekdays 9:40 AM ET (fallback)")
@@ -663,7 +766,9 @@ async def get_scheduler_status():
         "last_run":           scheduler_state["last_run"],
         "last_error":         scheduler_state["last_error"],
         "last_signal_check":  scheduler_state["last_signal_check"],
+        "last_drawdown_check": scheduler_state["last_drawdown_check"],
         "current_signals":    scheduler_state["signal_history"],
+        "drawdown_status":    scheduler_state["drawdown_status"],
         "jobs":               jobs,
         "timestamp":          datetime.now(ET).isoformat(),
     }
@@ -693,10 +798,23 @@ async def resume_scheduler():
     scheduler_state["paused"] = False
     scheduler_state["error_count"] = 0
     scheduler_state["last_error"] = {}
+    scheduler_state["drawdown_status"]["kill_switch_fired"] = False
+    scheduler_state["drawdown_status"]["warnings"] = []
+    scheduler_state["drawdown_status"]["position_alerts"] = []
     for job in scheduler.get_jobs():
         job.resume()
-    logger.info("▶️  Scheduler resumed")
+    logger.info("▶️  Scheduler resumed — all state cleared")
     return {"status": "resumed"}
+
+@app.post("/api/scheduler/check-drawdown")
+async def check_drawdown_now():
+    """Manually trigger a drawdown check immediately"""
+    await run_in_threadpool(_drawdown_monitor)
+    return {
+        "status":          "checked",
+        "drawdown_status": scheduler_state["drawdown_status"],
+        "timestamp":       datetime.now(ET).isoformat(),
+    }
 
 @app.post("/api/scheduler/run/{strategy}")
 async def trigger_scheduled_strategy(strategy: str):
