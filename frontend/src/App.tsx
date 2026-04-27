@@ -2,7 +2,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
 
-const API_URL = 'http://localhost:8000';
+const API_URL = 'https://qis-trading.com';
 
 // ─── TYPES ────────────────────────────────────────────────────
 

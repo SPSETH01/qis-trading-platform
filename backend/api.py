@@ -25,7 +25,7 @@ app = FastAPI(title="QIS Trading Platform API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "http://134.209.42.38:3000", "https://qis-trading.com", "https://www.qis-trading.com"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
