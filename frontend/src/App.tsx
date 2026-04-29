@@ -67,6 +67,18 @@ interface SchedulerStatus {
   jobs: SchedulerJob[];
 }
 
+interface Trade {
+  id: number;
+  timestamp: string;
+  symbol: string;
+  action: 'BUY' | 'SELL';
+  shares: number;
+  price: number;
+  value: number;
+  reason: string;
+  strategy: string;
+}
+
 // ─── STYLES ───────────────────────────────────────────────────
 
 const S = {
@@ -319,6 +331,7 @@ const Metric = ({ label, value, sub, color }: {
 const fmt = (n: number, decimals = 2) => n.toFixed(decimals);
 const fmtUSD = (n: number) => `$${Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const fmtTime = (iso: string) => iso ? new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
+const fmtDateTime = (iso: string) => iso ? new Date(iso).toLocaleString('en-US', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
 
 // ─── MAIN APP ─────────────────────────────────────────────────
 
@@ -336,12 +349,13 @@ export default function App() {
   const [regime, setRegime] = useState<Regime | null>(null);
   const [scheduler, setScheduler] = useState<SchedulerStatus | null>(null);
   const [portfolioHistory, setPortfolioHistory] = useState<{ time: string; value: number }[]>([]);
+  const [trades, setTrades] = useState<Trade[]>([]);
 
   // ─── DATA FETCHING ──────────────────────────────────────────
 
   const fetchAll = useCallback(async () => {
     try {
-      const [statusRes, portfolioRes, signalsRes, positionsRes, regimeRes, schedulerRes] =
+      const [statusRes, portfolioRes, signalsRes, positionsRes, regimeRes, schedulerRes, tradesRes] =
         await Promise.all([
           fetch(`${API_URL}/api/status`),
           fetch(`${API_URL}/api/portfolio`),
@@ -349,15 +363,17 @@ export default function App() {
           fetch(`${API_URL}/api/positions`),
           fetch(`${API_URL}/api/regime`),
           fetch(`${API_URL}/api/scheduler/status`),
+          fetch(`${API_URL}/api/trades`),
         ]);
 
-      const [status, port, sigs, pos, reg, sched] = await Promise.all([
+      const [status, port, sigs, pos, reg, sched, tradesData] = await Promise.all([
         statusRes.json(),
         portfolioRes.json(),
         signalsRes.json(),
         positionsRes.json(),
         regimeRes.json(),
         schedulerRes.json(),
+        tradesRes.json(),
       ]);
 
       setConnected(status.connected);
@@ -366,6 +382,7 @@ export default function App() {
       setPositions(pos.positions || []);
       setRegime(reg);
       setScheduler(sched);
+      setTrades(tradesData.trades || []);
       setLastUpdate(new Date().toLocaleTimeString());
 
       // Append to portfolio history
@@ -375,7 +392,7 @@ export default function App() {
             time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
             value: port.portfolio_value
           }];
-          return next.slice(-48); // keep last 48 data points
+          return next.slice(-48);
         });
       }
 
@@ -389,7 +406,7 @@ export default function App() {
 
   useEffect(() => {
     fetchAll();
-    const interval = setInterval(fetchAll, 30000); // refresh every 30s
+    const interval = setInterval(fetchAll, 30000);
     return () => clearInterval(interval);
   }, [fetchAll]);
 
@@ -439,8 +456,9 @@ export default function App() {
   const pnl = portfolio?.pnl ?? 0;
   const pnlPct = portfolio?.pnl_pct ?? 0;
   const portfolioValue = portfolio?.portfolio_value ?? 0;
-  const drawdown = portfolio?.drawdown_pct ?? 0;
   const triggeredSignals = signals.filter(s => s.status === 'triggered').length;
+  const buyCount = trades.filter(t => t.action === 'BUY').length;
+  const sellCount = trades.filter(t => t.action === 'SELL').length;
 
   // ─── RENDER ─────────────────────────────────────────────────
 
@@ -491,7 +509,7 @@ export default function App() {
           </div>
         )}
         <div style={S.nav}>
-          {['dashboard', 'signals', 'positions', 'scheduler', 'risk'].map(tab => (
+          {['dashboard', 'signals', 'positions', 'activity', 'scheduler', 'risk'].map(tab => (
             <button key={tab} style={S.navBtn(activeTab === tab)} onClick={() => setActiveTab(tab)}>
               {tab.toUpperCase()}
             </button>
@@ -649,6 +667,48 @@ export default function App() {
                 )}
               </div>
             </div>
+
+            {/* RECENT ACTIVITY PREVIEW */}
+            {trades.length > 0 && (
+              <div style={S.card}>
+                <div style={S.cardTitle}>
+                  Recent Activity
+                  <span style={S.badge('accent')}>{trades.length} TRADES</span>
+                  <button
+                    style={{ ...S.btn('accent'), marginLeft: 'auto', fontSize: '10px', padding: '4px 10px' }}
+                    onClick={() => setActiveTab('activity')}
+                  >
+                    VIEW ALL →
+                  </button>
+                </div>
+                <table style={S.table}>
+                  <thead>
+                    <tr>
+                      <th style={S.th}>Time</th>
+                      <th style={S.th}>Symbol</th>
+                      <th style={S.th}>Action</th>
+                      <th style={S.th}>Shares</th>
+                      <th style={S.th}>Value</th>
+                      <th style={S.th}>Strategy</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {trades.slice(0, 5).map((trade) => (
+                      <tr key={trade.id}>
+                        <td style={{ ...S.td, color: '#4a5568', fontSize: '10px' }}>{fmtDateTime(trade.timestamp)}</td>
+                        <td style={{ ...S.td, color: '#00e5ff', fontWeight: 700 }}>{trade.symbol}</td>
+                        <td style={S.td}>
+                          <span style={S.badge(trade.action === 'BUY' ? 'green' : 'red')}>{trade.action}</span>
+                        </td>
+                        <td style={S.td}>{trade.shares}</td>
+                        <td style={{ ...S.td, fontWeight: 700 }}>${trade.value.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                        <td style={{ ...S.td, color: '#a78bfa', fontSize: '11px' }}>{trade.strategy}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </>
         )}
 
@@ -742,6 +802,76 @@ export default function App() {
               </table>
             )}
           </div>
+        )}
+
+        {/* ── ACTIVITY TAB ──────────────────────────────────── */}
+        {activeTab === 'activity' && (
+          <>
+            {/* Summary stats */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px' }}>
+              {[
+                { label: 'Total Trades', value: `${trades.length}`, color: '#00e5ff' },
+                { label: 'Buys', value: `${buyCount}`, color: '#00e676' },
+                { label: 'Sells', value: `${sellCount}`, color: '#ff1744' },
+                { label: 'Total Volume', value: `$${trades.reduce((sum, t) => sum + t.value, 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}`, color: '#a78bfa' },
+              ].map((item, i) => (
+                <div key={i} style={S.metric}>
+                  <div style={S.metricLabel}>{item.label}</div>
+                  <div style={S.metricValue(item.color)}>{item.value}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Trade log */}
+            <div style={S.card}>
+              <div style={S.cardTitle}>
+                Trade History
+                <span style={S.badge('accent')}>{trades.length} TRADES</span>
+              </div>
+              {trades.length === 0 ? (
+                <div style={{ color: '#4a5568', fontFamily: 'Space Mono', fontSize: '12px', padding: '20px 0' }}>
+                  No trades logged yet — trades will appear here after next execution
+                </div>
+              ) : (
+                <table style={S.table}>
+                  <thead>
+                    <tr>
+                      <th style={S.th}>#</th>
+                      <th style={S.th}>Date / Time</th>
+                      <th style={S.th}>Symbol</th>
+                      <th style={S.th}>Action</th>
+                      <th style={S.th}>Shares</th>
+                      <th style={S.th}>Price</th>
+                      <th style={S.th}>Value</th>
+                      <th style={S.th}>Strategy</th>
+                      <th style={S.th}>Reason</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {trades.map((trade) => (
+                      <tr key={trade.id}>
+                        <td style={{ ...S.td, color: '#4a5568', fontSize: '10px' }}>{trade.id}</td>
+                        <td style={{ ...S.td, color: '#4a5568', fontSize: '10px' }}>{fmtDateTime(trade.timestamp)}</td>
+                        <td style={{ ...S.td, color: '#00e5ff', fontWeight: 700 }}>{trade.symbol}</td>
+                        <td style={S.td}>
+                          <span style={S.badge(trade.action === 'BUY' ? 'green' : 'red')}>
+                            {trade.action}
+                          </span>
+                        </td>
+                        <td style={S.td}>{trade.shares}</td>
+                        <td style={S.td}>${fmt(trade.price)}</td>
+                        <td style={{ ...S.td, fontWeight: 700 }}>
+                          ${trade.value.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                        </td>
+                        <td style={{ ...S.td, color: '#a78bfa', fontSize: '11px' }}>{trade.strategy || '—'}</td>
+                        <td style={{ ...S.td, color: '#4a5568', fontSize: '11px' }}>{trade.reason || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </>
         )}
 
         {/* ── SCHEDULER TAB ─────────────────────────────────── */}
