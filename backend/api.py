@@ -839,3 +839,33 @@ if __name__ == "__main__":
         port=8000,
         reload=True
     )
+# ─── TRADE HISTORY ────────────────────────────────────────────
+
+@app.get("/api/trades")
+async def get_trade_history(limit: int = 100):
+    """Return trade history log"""
+    try:
+        trades = get_trades(limit)
+        return {"trades": trades, "count": len(trades)}
+    except Exception as e:
+        logger.error(f"Trade history error: {e}")
+        return {"trades": [], "count": 0, "error": str(e)}
+
+@app.get("/api/trades/summary")
+async def get_trades_summary():
+    """Return trade summary by strategy"""
+    try:
+        summary = get_trade_summary()
+        return {"summary": summary}
+    except Exception as e:
+        logger.error(f"Trade summary error: {e}")
+        return {"summary": {}, "error": str(e)}
+
+async def get_trades_summary():
+    """Return trade summary by strategy"""
+    try:
+        summary = get_trade_summary()
+        return {"summary": summary}
+    except Exception as e:
+        logger.error(f"Trade summary error: {e}")
+        return {"summary": {}, "error": str(e)}
