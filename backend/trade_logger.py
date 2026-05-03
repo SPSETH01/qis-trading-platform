@@ -3,9 +3,7 @@ import os
 from datetime import datetime
 from loguru import logger
 
-TRADE_LOG_FILE = os.path.join(
-    os.path.dirname(__file__), "logs", "trades.json"
-)
+TRADE_LOG_FILE = os.path.join(os.path.dirname(__file__), "logs", "trades.json")
 
 def _load_trades():
     if not os.path.exists(TRADE_LOG_FILE):

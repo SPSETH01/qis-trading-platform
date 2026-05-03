@@ -16,6 +16,7 @@ from ibkr_client import IBKRClient
 from strategies.macro_regime import MacroRegimeStrategy
 from strategies.crypto_trend import CryptoTrendStrategy
 from strategies.thematic_rotation import ThematicRotationStrategy
+from trade_logger import log_trade, get_trades, get_trade_summary
 
 load_dotenv()
 
