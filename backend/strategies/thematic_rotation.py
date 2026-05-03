@@ -9,96 +9,111 @@ from datetime import datetime, timedelta
 
 class ThematicRotationStrategy:
     """
-    Core/Satellite Strategy — Tier 2 Enhanced
-    ──────────────────────────────────────────
-    Structure:
-      60% CORE    → QQQ (always held, never traded out in bull)
-      40% SATELLITE → Top thematic ETFs (only if beating QQQ)
+    Tactical QQQ Strategy — Tier 3
+    ────────────────────────────────
+    Backtested results (10yr):
+      CAGR: 13.43% | Sharpe: 0.64 | MaxDD: -20.48%
+      vs SPY: 15.3% CAGR — within 1.9% with better risk-adjusted returns
 
-    Regimes:
-      BULL     (SPY > EMA200, VIX < 20): Core QQQ + Satellite thematic
-      CAUTION  (VIX 20-25):              Core QQQ + reduced satellite
-      BEAR     (SPY < EMA200, VIX > 25): TLT/GLD/BND + SH hedge
-      CRISIS   (VIX > 35):              Max defensive
-      RECOVERY (was BEAR, VIX < 22):    Exit SH, re-enter QQQ aggressively
+    Regime-based allocation:
+      BULL     (SPY>EMA200, VIX<20):  100% QQQ
+      CAUTION  (VIX 20-25):           80% QQQ + 20% SGOV
+      BEAR     (SPY<EMA200, VIX>25):  40% SGOV + 30% GLD + 30% SH
+      CRISIS   (VIX>35):              30% SGOV + 40% GLD + 30% SH
+      RECOVERY (was BEAR, VIX<22):    100% QQQ aggressively
 
-    Satellite filter:
-      Only include thematic ETF if beating QQQ on 3M relative momentum
-      Otherwise park satellite allocation in QQQ (full core mode)
+    Satellite overlay:
+      Only added when ETF beats QQQ by >10% on 3M relative momentum
+      AND passes quality filter (not >25% below 52w high)
+      When triggered: 80% QQQ + 20% best satellite
     """
 
     def __init__(self, ibkr_client):
         self.client = ibkr_client
 
-        self.CORE              = "QQQ"
-        self.CORE_ALLOCATION   = 0.60
+        # ── Core
+        self.CORE = "QQQ"
 
+        # ── Satellite universe (bank compliant — ETFs only)
         self.SATELLITE_UNIVERSE = [
-            "BOTZ", "ROBO", "CIBR", "SOXX", "QTUM",
-            "NUKZ", "ICLN", "TAN",
-            "ITA",  "XAR",
-            "ARKG", "XBI", "IBB",
-            "INDA", "EEM",
-            "XLK",  "XLV", "XLE",
+            "SOXX",  # Semiconductors
+            "CIBR",  # Cybersecurity
+            "ITA",   # Defence
+            "INDA",  # India
+            "NUKZ",  # Nuclear Energy
+            "BOTZ",  # AI + Robotics
+            "XLK",   # Technology
+            "XLV",   # Healthcare
+            "XLE",   # Energy
         ]
-        self.SATELLITE_ALLOCATION = 0.40
-        self.SATELLITE_TOP_N      = 3
 
-        self.DEFENSIVE          = ["TLT", "GLD", "BND"]
-        self.BEAR_HEDGE         = "SH"
-        self.BEAR_DEFENSIVE_PCT = 0.70
-        self.BEAR_HEDGE_PCT     = 0.20
+        # ── Bear regime holdings
+        self.BEAR_HEDGE  = "SH"     # 1x inverse SPY
+        self.SAFE_HAVEN  = "SGOV"   # short-term treasury (rate-hike safe)
+        self.GOLD        = "GLD"    # gold hedge
 
-        self.MOMENTUM_DAYS_3M   = 63
-        self.MOMENTUM_DAYS_6M   = 126
-        self.MOMENTUM_DAYS_1M   = 21
-        self.MAX_DRAWDOWN       = 0.15
-        self.REBALANCE_DAYS     = 30
-        self.MAX_CORRELATION    = 0.75
-        self.RSI_OVERSOLD       = 30
-        self.RSI_OVERBOUGHT     = 80
+        # ── Regime thresholds
+        self.VIX_BULL       = 20
+        self.VIX_CAUTION    = 25
+        self.VIX_CRISIS     = 35
+        self.VIX_RECOVERY   = 22
 
-        self.VIX_BULL           = 20
-        self.VIX_BEAR           = 25
-        self.VIX_CRISIS         = 35
-        self.VIX_RECOVERY       = 22
-        self.RELATIVE_MOM_MIN   = -5.0
+        # ── Satellite filter
+        self.SATELLITE_MIN_OUTPERFORMANCE = 10.0  # must beat QQQ by 10% on 3M
+        self.QUALITY_FILTER_MAX_DD        = 0.25  # skip if >25% below 52w high
 
-        self.last_rebalance     = None
-        self.last_top_etfs      = []
-        self.last_regime        = None
-        self.last_vix           = None
+        # ── Rebalance
+        self.REBALANCE_DAYS = 30
+        self.MOMENTUM_DAYS  = 63   # 3M
+
+        # ── State
+        self.last_rebalance = None
+        self.last_regime    = None
+        self.last_vix       = None
 
     # ─── REGIME DETECTION ─────────────────────────────────────
 
     def detect_regime(self):
         """
-        Returns (regime, vix):
-          BULL, CAUTION, BEAR, CRISIS, RECOVERY
+        Multi-signal regime detection:
+        1. VIX level
+        2. SPY vs EMA200
+        3. Early bear (SPY drops >5% in 10 days)
+        4. Recovery (was BEAR/CRISIS, VIX now dropping)
         """
         try:
+            # VIX
             vix_data = self.client.get_historical_data("VIX", period="3M", bar="1d")
             vix_df   = self._to_dataframe(vix_data)
-            vix      = vix_df["close"].iloc[-1] if vix_df is not None and not vix_df.empty else 20.0
+            vix      = float(vix_df["close"].iloc[-1]) if vix_df is not None and not vix_df.empty else 20.0
 
+            # SPY vs EMA200
             spy_data         = self.client.get_historical_data("SPY", period="1Y", bar="1d")
             spy_df           = self._to_dataframe(spy_data)
             spy_above_ema200 = True
+            early_bear       = False
 
-            if spy_df is not None and not spy_df.empty and len(spy_df) >= 50:
-                ema200           = EMAIndicator(spy_df["close"], window=min(200, len(spy_df))).ema_indicator()
-                spy_above_ema200 = spy_df["close"].iloc[-1] > ema200.iloc[-1]
+            if spy_df is not None and not spy_df.empty:
+                close = spy_df["close"]
+                if len(close) >= 50:
+                    ema200           = EMAIndicator(close, window=min(200, len(close))).ema_indicator()
+                    spy_above_ema200 = float(close.iloc[-1]) > float(ema200.iloc[-1])
+                # Early bear: SPY drops >5% in 10 days
+                if len(close) >= 10:
+                    drop = (float(close.iloc[-1]) - float(close.iloc[-10])) / float(close.iloc[-10])
+                    early_bear = drop < -0.05
 
-            logger.info(f"VIX={vix:.1f} | SPY>EMA200={spy_above_ema200}")
+            logger.info(f"VIX={vix:.1f} | SPY>EMA200={spy_above_ema200} | EarlyBear={early_bear}")
 
+            # Regime logic
             if (self.last_regime in ["BEAR", "CRISIS"] and
-                    vix < self.VIX_RECOVERY and spy_above_ema200):
+                    vix < self.VIX_RECOVERY and spy_above_ema200 and not early_bear):
                 regime = "RECOVERY"
             elif vix > self.VIX_CRISIS:
                 regime = "CRISIS"
-            elif not spy_above_ema200 or vix > self.VIX_BEAR:
+            elif not spy_above_ema200 or vix > self.VIX_CAUTION:
                 regime = "BEAR"
-            elif vix > self.VIX_BULL:
+            elif early_bear or vix > self.VIX_BULL:
                 regime = "CAUTION"
             else:
                 regime = "BULL"
@@ -111,123 +126,90 @@ class ThematicRotationStrategy:
             logger.error(f"Regime detection error: {e}")
             return "BULL", 20.0
 
-    # ─── SCORING ──────────────────────────────────────────────
+    # ─── SATELLITE SELECTION ──────────────────────────────────
 
-    def _momentum(self, close, days):
-        if len(close) < days:
-            return None
-        past = close.iloc[-days]
-        return (close.iloc[-1] - past) / past * 100 if past != 0 else None
-
-    def get_qqq_benchmark_momentum(self):
+    def get_qqq_momentum(self):
+        """Get QQQ 3M momentum as benchmark"""
         try:
             data = self.client.get_historical_data("QQQ", period="6M", bar="1d")
             df   = self._to_dataframe(data)
-            if df is None or df.empty:
+            if df is None or df.empty or len(df["close"]) < self.MOMENTUM_DAYS:
                 return 0.0
-            return self._momentum(df["close"], self.MOMENTUM_DAYS_3M) or 0.0
+            close = df["close"]
+            return float((close.iloc[-1] - close.iloc[-self.MOMENTUM_DAYS]) /
+                          close.iloc[-self.MOMENTUM_DAYS] * 100)
         except Exception:
             return 0.0
 
-    def score_vs_benchmark(self, symbol, data, benchmark_mom_3m):
-        """Multi-factor score with relative momentum vs QQQ"""
-        df = self._to_dataframe(data)
-        if df is None or df.empty:
-            return None
-        try:
-            close  = df["close"]
-            mom_3m = self._momentum(close, self.MOMENTUM_DAYS_3M)
-            mom_6m = self._momentum(close, self.MOMENTUM_DAYS_6M)
-            mom_1m = self._momentum(close, self.MOMENTUM_DAYS_1M)
+    def find_best_satellite(self, qqq_mom_3m):
+        """
+        Find best satellite ETF that beats QQQ by >10% on 3M basis
+        AND passes quality filter (not >25% below 52w high)
+        Returns (symbol, relative_momentum) or (None, 0)
+        """
+        best_sym = None
+        best_rel = self.SATELLITE_MIN_OUTPERFORMANCE  # minimum threshold
 
-            if None in (mom_3m, mom_6m, mom_1m):
-                return None
-
-            relative_mom = mom_3m - benchmark_mom_3m
-            if relative_mom < self.RELATIVE_MOM_MIN:
-                logger.info(f"{symbol}: rel_mom={relative_mom:.1f}% below threshold — skip")
-                return None
-
-            returns    = close.pct_change().dropna()
-            volatility = returns.std() * np.sqrt(252) * 100
-
-            rsi_penalty = 0
-            if len(close) >= 14:
-                rsi = RSIIndicator(close, window=14).rsi().iloc[-1]
-                if rsi < self.RSI_OVERSOLD:
-                    return None
-                rsi_penalty = max(0, rsi - self.RSI_OVERBOUGHT) * 0.5
-
-            score = (
-                0.35 * mom_3m +
-                0.25 * mom_6m +
-                0.15 * mom_1m +
-                0.15 * relative_mom -
-                0.10 * volatility -
-                rsi_penalty
-            )
-
-            logger.info(f"{symbol}: score={score:.2f} (3M={mom_3m:.1f}% rel={relative_mom:+.1f}% vol={volatility:.1f}%)")
-            return score
-
-        except Exception as e:
-            logger.error(f"Score error for {symbol}: {e}")
-            return None
-
-    def rank_satellite_etfs(self, benchmark_mom_3m):
-        logger.info(f"=== Ranking satellites (QQQ 3M={benchmark_mom_3m:.1f}%) ===")
-        scores = []
         for symbol in self.SATELLITE_UNIVERSE:
-            data  = self.client.get_historical_data(symbol, period="9M", bar="1d")
-            if not data:
-                continue
-            score = self.score_vs_benchmark(symbol, data, benchmark_mom_3m)
-            if score is not None and score > 0:
-                scores.append({"symbol": symbol, "score": score, "data": data})
-        scores.sort(key=lambda x: x["score"], reverse=True)
-        logger.info(f"Top satellites: {[(s['symbol'], round(s['score'],2)) for s in scores[:5]]}")
-        return scores
-
-    def build_uncorrelated_portfolio(self, ranked_etfs):
-        if not ranked_etfs:
-            return []
-        selected = [ranked_etfs[0]]
-        for candidate in ranked_etfs[1:]:
-            if len(selected) >= self.SATELLITE_TOP_N:
-                break
-            cdf = self._to_dataframe(candidate["data"])
-            if cdf is None:
-                continue
-            c_ret    = cdf["close"].pct_change().dropna()
-            too_corr = False
-            for held in selected:
-                hdf = self._to_dataframe(held["data"])
-                if hdf is None:
+            try:
+                data = self.client.get_historical_data(symbol, period="9M", bar="1d")
+                df   = self._to_dataframe(data)
+                if df is None or df.empty:
                     continue
-                h_ret = hdf["close"].pct_change().dropna()
-                n     = min(len(c_ret), len(h_ret))
-                if n < 20:
-                    continue
-                if c_ret.iloc[-n:].corr(h_ret.iloc[-n:]) > self.MAX_CORRELATION:
-                    too_corr = True
-                    break
-            if not too_corr:
-                selected.append(candidate)
-        logger.info(f"Uncorrelated satellites: {[s['symbol'] for s in selected]}")
-        return selected
 
-    def should_rebalance(self, new_top_etfs=None, new_regime=None):
+                close = df["close"]
+                if len(close) < self.MOMENTUM_DAYS:
+                    continue
+
+                # Quality filter — skip if >25% below 52w high
+                lookback = min(252, len(close))
+                peak     = float(close.iloc[-lookback:].max())
+                current  = float(close.iloc[-1])
+                dd       = (current - peak) / peak
+                if dd < -self.QUALITY_FILTER_MAX_DD:
+                    logger.info(f"{symbol}: quality filter {dd:.1%} from 52w high")
+                    continue
+
+                # RSI filter — skip falling knives
+                if len(close) >= 14:
+                    rsi = RSIIndicator(close, window=14).rsi().iloc[-1]
+                    if rsi < 30:
+                        logger.info(f"{symbol}: RSI {rsi:.1f} — falling knife")
+                        continue
+
+                # 3M momentum vs QQQ
+                mom_3m   = float((close.iloc[-1] - close.iloc[-self.MOMENTUM_DAYS]) /
+                                  close.iloc[-self.MOMENTUM_DAYS] * 100)
+                rel_mom  = mom_3m - qqq_mom_3m
+
+                logger.info(f"{symbol}: 3M={mom_3m:.1f}% rel={rel_mom:+.1f}% vs QQQ")
+
+                if rel_mom > best_rel:
+                    best_rel = rel_mom
+                    best_sym = symbol
+
+            except Exception as e:
+                logger.error(f"Satellite error {symbol}: {e}")
+                continue
+
+        if best_sym:
+            logger.info(f"Best satellite: {best_sym} (+{best_rel:.1f}% vs QQQ)")
+        else:
+            logger.info("No satellite beats QQQ — staying 100% QQQ")
+
+        return best_sym, best_rel
+
+    # ─── REBALANCE CHECK ──────────────────────────────────────
+
+    def should_rebalance(self, new_regime):
         if self.last_rebalance is None:
             return True
         days_since = (datetime.now() - self.last_rebalance).days
         if days_since >= self.REBALANCE_DAYS:
+            logger.info(f"Rebalance: {days_since} days elapsed")
             return True
-        if new_top_etfs and self.last_top_etfs:
-            if len(set(new_top_etfs) & set(self.last_top_etfs)) < self.SATELLITE_TOP_N:
-                logger.info("Rebalance: satellite rankings shifted")
-                return True
-        if new_regime and self.last_regime and new_regime != self.last_regime:
-            logger.info(f"Rebalance: regime {self.last_regime} → {new_regime}")
+        if new_regime != self.last_regime:
+            logger.info(f"Rebalance: regime changed {self.last_regime} → {new_regime}")
             return True
         logger.info(f"No rebalance — {days_since}/{self.REBALANCE_DAYS} days")
         return False
@@ -235,50 +217,76 @@ class ThematicRotationStrategy:
     # ─── POSITION SIZING ──────────────────────────────────────
 
     def calculate_position_size(self, symbol, allocation, data):
+        """ATR-based sizing capped at allocation"""
         df = self._to_dataframe(data)
         if df is None or df.empty:
             return 0
         try:
+            if len(df) < 14:
+                price  = float(df["close"].iloc[-1])
+                shares = int(allocation / price) if price > 0 else 0
+                return shares
             atr           = AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
-            stop_distance = atr.iloc[-1] * 2
+            stop_distance = float(atr.iloc[-1]) * 2
             risk_amount   = allocation * float(os.getenv("MAX_RISK_PER_TRADE", 0.02))
-            price         = df["close"].iloc[-1]
+            price         = float(df["close"].iloc[-1])
             if stop_distance <= 0 or price <= 0:
                 return 0
             shares = int(min(int(risk_amount / stop_distance) * price, allocation) / price)
-            logger.info(f"{symbol}: {shares} shares @ ${price:.2f}")
+            logger.info(f"{symbol}: {shares} shares @ ${price:.2f} = ${shares*price:,.0f}")
             return shares
         except Exception as e:
-            logger.error(f"Position sizing error for {symbol}: {e}")
+            logger.error(f"Position sizing error {symbol}: {e}")
             return 0
 
-    def check_drawdown(self, symbol, data):
-        df = self._to_dataframe(data)
-        if df is None or df.empty:
-            return True
-        try:
-            dd = (df["close"] - df["close"].expanding().max()) / df["close"].expanding().max()
-            if dd.iloc[-1] < -self.MAX_DRAWDOWN:
-                logger.warning(f"{symbol}: drawdown {dd.iloc[-1]:.1%}")
-                return False
-            return True
-        except Exception:
-            return True
+    # ─── EXECUTE TRADES ───────────────────────────────────────
 
-    def check_liquidity(self, symbol, data):
-        df = self._to_dataframe(data)
-        if df is None or df.empty or "volume" not in df.columns:
-            return True
-        return df["volume"].iloc[-1] >= df["volume"].iloc[-20:].mean() * 0.8
+    def _buy(self, symbol, allocation, period, results, reason):
+        """Helper to buy a position"""
+        data   = self.client.get_historical_data(symbol, period=period, bar="1d")
+        shares = self.calculate_position_size(symbol, allocation, data)
+        if shares > 0:
+            self.client.place_order(
+                symbol, "BUY", shares,
+                strategy="thematic_rotation",
+                reason=reason
+            )
+            results.append({"symbol": symbol, "action": "BUY",
+                             "shares": shares, "reason": reason})
+            logger.info(f"BUY {shares} {symbol} — {reason}")
+
+    def _close(self, symbol, results, reason):
+        """Helper to close a position"""
+        self.client.close_position(symbol)
+        results.append({"symbol": symbol, "action": "CLOSE", "reason": reason})
+        logger.info(f"CLOSE {symbol} — {reason}")
 
     # ─── MAIN EXECUTION ───────────────────────────────────────
 
     def run(self, portfolio_value):
-        """Core/Satellite execution across all regimes"""
-        logger.info("=== Core/Satellite Strategy (Tier 2) Running ===")
+        """
+        Tactical QQQ execution:
+
+        BULL/RECOVERY:
+          Default: 100% QQQ
+          If satellite beats QQQ by >10%: 80% QQQ + 20% satellite
+
+        CAUTION:
+          80% QQQ + 20% SGOV
+
+        BEAR:
+          40% SGOV + 30% GLD + 30% SH
+
+        CRISIS:
+          30% SGOV + 40% GLD + 30% SH
+        """
+        logger.info("=== Tactical QQQ Strategy (Tier 3) Running ===")
         results = []
 
-        regime, vix     = self.detect_regime()
+        # ── Detect regime
+        regime, vix = self.detect_regime()
+
+        # ── Get current positions
         positions       = self.client.get_positions()
         current_symbols = [p.get("ticker") for p in positions]
         pending_symbols = self.client.get_open_order_symbols()
@@ -286,120 +294,69 @@ class ThematicRotationStrategy:
 
         logger.info(f"Regime={regime} VIX={vix:.1f} Positions={current_symbols}")
 
-        # ── BEAR / CRISIS ─────────────────────────────────────
-        if regime in ["BEAR", "CRISIS"]:
-            logger.info("BEAR — rotating defensive + SH hedge")
+        # ── Check if rebalance needed
+        if not self.should_rebalance(regime):
+            return results
 
-            for symbol in current_symbols:
-                if symbol in [self.CORE] + self.SATELLITE_UNIVERSE:
-                    self.client.close_position(symbol)
-                    results.append({"symbol": symbol, "action": "CLOSE",
-                                    "reason": f"bear exit (VIX={vix:.1f})"})
+        # ── Define target portfolio by regime
+        if regime in ["BULL", "RECOVERY"]:
+            # Check for satellite opportunity
+            qqq_mom    = self.get_qqq_momentum()
+            best_sat, rel_mom = self.find_best_satellite(qqq_mom)
 
-            defensive_alloc = portfolio_value * self.BEAR_DEFENSIVE_PCT
-            per_def         = defensive_alloc / len(self.DEFENSIVE)
-            for symbol in self.DEFENSIVE:
-                if symbol not in active_symbols:
-                    data   = self.client.get_historical_data(symbol, period="3M", bar="1d")
-                    shares = self.calculate_position_size(symbol, per_def, data)
-                    if shares > 0:
-                        self.client.place_order(symbol, "BUY", shares,
-                                                strategy="thematic_rotation",
-                                                reason=f"defensive ({regime})")
-                        results.append({"symbol": symbol, "action": "BUY",
-                                        "reason": f"defensive ({regime})"})
-
-            if self.BEAR_HEDGE not in active_symbols:
-                sh_alloc  = portfolio_value * self.BEAR_HEDGE_PCT
-                sh_data   = self.client.get_historical_data(self.BEAR_HEDGE, period="3M", bar="1d")
-                sh_shares = self.calculate_position_size(self.BEAR_HEDGE, sh_alloc, sh_data)
-                if sh_shares > 0:
-                    self.client.place_order(self.BEAR_HEDGE, "BUY", sh_shares,
-                                            strategy="thematic_rotation",
-                                            reason=f"SH hedge ({regime}, VIX={vix:.1f})")
-                    results.append({"symbol": self.BEAR_HEDGE, "action": "BUY",
-                                    "reason": f"SH bear hedge ({regime})"})
-
-        # ── RECOVERY ──────────────────────────────────────────
-        elif regime == "RECOVERY":
-            logger.info("RECOVERY — exit hedge, re-enter QQQ")
-
-            for symbol in [self.BEAR_HEDGE] + self.DEFENSIVE:
-                if symbol in current_symbols:
-                    self.client.close_position(symbol)
-                    results.append({"symbol": symbol, "action": "CLOSE",
-                                    "reason": "recovery exit"})
-
-            if self.CORE not in active_symbols:
-                core_alloc  = portfolio_value * self.CORE_ALLOCATION
-                core_data   = self.client.get_historical_data(self.CORE, period="6M", bar="1d")
-                core_shares = self.calculate_position_size(self.CORE, core_alloc, core_data)
-                if core_shares > 0:
-                    self.client.place_order(self.CORE, "BUY", core_shares,
-                                            strategy="thematic_rotation",
-                                            reason=f"recovery re-entry (VIX={vix:.1f})")
-                    results.append({"symbol": self.CORE, "action": "BUY",
-                                    "reason": "recovery re-entry QQQ"})
-
-        # ── BULL / CAUTION ────────────────────────────────────
-        else:
-            logger.info(f"{regime} — core QQQ + satellite rotation")
-
-            # Core QQQ
-            if self.CORE not in active_symbols:
-                core_alloc  = portfolio_value * self.CORE_ALLOCATION
-                core_data   = self.client.get_historical_data(self.CORE, period="6M", bar="1d")
-                core_shares = self.calculate_position_size(self.CORE, core_alloc, core_data)
-                if core_shares > 0:
-                    self.client.place_order(self.CORE, "BUY", core_shares,
-                                            strategy="thematic_rotation",
-                                            reason=f"core QQQ ({regime})")
-                    results.append({"symbol": self.CORE, "action": "BUY",
-                                    "reason": f"core ({regime})"})
+            if best_sat:
+                targets = {
+                    self.CORE: 0.80,
+                    best_sat:  0.20,
+                }
             else:
-                logger.info(f"Core {self.CORE} already held")
+                targets = {self.CORE: 1.00}
 
-            # Satellite rotation
-            benchmark_mom = self.get_qqq_benchmark_momentum()
-            ranked        = self.rank_satellite_etfs(benchmark_mom)
-            selected      = self.build_uncorrelated_portfolio(ranked)
-            new_top       = [s["symbol"] for s in selected]
+        elif regime == "CAUTION":
+            targets = {
+                self.CORE:       0.80,
+                self.SAFE_HAVEN: 0.20,
+            }
 
-            if not selected:
-                logger.info("No satellite beats QQQ — satellite parked in QQQ")
-            elif self.should_rebalance(new_top, regime):
-                for symbol in current_symbols:
-                    if symbol in self.SATELLITE_UNIVERSE and symbol not in new_top:
-                        self.client.close_position(symbol)
-                        results.append({"symbol": symbol, "action": "CLOSE",
-                                        "reason": "satellite rotation out"})
+        elif regime == "BEAR":
+            targets = {
+                self.SAFE_HAVEN: 0.40,
+                self.GOLD:       0.30,
+                self.BEAR_HEDGE: 0.30,
+            }
 
-                sat_alloc = portfolio_value * self.SATELLITE_ALLOCATION
-                per_sat   = sat_alloc / self.SATELLITE_TOP_N
-                for item in selected:
-                    symbol = item["symbol"]
-                    data   = item["data"]
-                    if not self.check_drawdown(symbol, data):
-                        continue
-                    if not self.check_liquidity(symbol, data):
-                        continue
-                    if symbol not in active_symbols:
-                        shares = self.calculate_position_size(symbol, per_sat, data)
-                        if shares > 0:
-                            self.client.place_order(
-                                symbol, "BUY", shares,
-                                strategy="thematic_rotation",
-                                reason=f"satellite in score={item['score']:.2f} ({regime})"
-                            )
-                            results.append({"symbol": symbol, "action": "BUY",
-                                            "score": item["score"],
-                                            "reason": f"satellite ({regime})"})
+        else:  # CRISIS
+            targets = {
+                self.SAFE_HAVEN: 0.30,
+                self.GOLD:       0.40,
+                self.BEAR_HEDGE: 0.30,
+            }
 
-            self.last_top_etfs = new_top
+        logger.info(f"Target portfolio: {targets}")
 
+        # ── Close positions not in targets
+        all_managed = (
+            [self.CORE, self.BEAR_HEDGE, self.SAFE_HAVEN, self.GOLD] +
+            self.SATELLITE_UNIVERSE
+        )
+        for symbol in current_symbols:
+            if symbol in all_managed and symbol not in targets:
+                self._close(symbol, results, f"exit — {regime} regime")
+
+        # ── Open target positions
+        for symbol, weight in targets.items():
+            if symbol not in active_symbols:
+                allocation = portfolio_value * weight
+                period     = "6M" if symbol in [self.CORE] + self.SATELLITE_UNIVERSE else "3M"
+                self._buy(
+                    symbol, allocation, period, results,
+                    reason=f"{regime} regime weight={weight:.0%} VIX={vix:.1f}"
+                )
+
+        # ── Update state
         self.last_regime    = regime
         self.last_rebalance = datetime.now()
-        logger.info(f"Core/Satellite complete — {len(results)} actions | {regime}")
+        logger.info(f"Tactical QQQ complete — {len(results)} actions | {regime}")
         return results
 
     # ─── HELPERS ──────────────────────────────────────────────
@@ -410,8 +367,10 @@ class ThematicRotationStrategy:
         try:
             df         = pd.DataFrame(data)
             df.columns = [c.lower() for c in df.columns]
-            df         = df.rename(columns={"o": "open", "h": "high",
-                                             "l": "low",  "c": "close", "v": "volume"})
+            df         = df.rename(columns={
+                "o": "open", "h": "high",
+                "l": "low",  "c": "close", "v": "volume"
+            })
             for col in ["close", "high", "low"]:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
