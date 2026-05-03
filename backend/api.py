@@ -849,14 +849,22 @@ async def backtest_run(years: int = 3, capital: float = 1000000, strategy: str =
     try:
         end_date   = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=years*365)).strftime("%Y-%m-%d")
-        use_multi  = strategy != "original"
-        name       = "Tier 1 (Multi-Factor + VIX)" if use_multi else "Original (3M Momentum)"
-        result = await run_in_threadpool(
-            run_backtest,
-            universe=BACKTEST_UNIVERSE, start_date=start_date, end_date=end_date,
-            starting_capital=capital, use_vix_filter=use_multi,
-            use_multi_factor=use_multi, strategy_name=name,
-        )
+        if strategy == "tier2":
+            from backtester import run_core_satellite
+            result = await run_in_threadpool(
+                run_core_satellite,
+                universe=BACKTEST_UNIVERSE, start_date=start_date, end_date=end_date,
+                starting_capital=capital, strategy_name="Tier 2 (Core/Satellite + SH)",
+            )
+        else:
+            use_multi  = strategy != "original"
+            name       = "Tier 1 (Multi-Factor + VIX)" if use_multi else "Original (3M Momentum)"
+            result = await run_in_threadpool(
+                run_backtest,
+                universe=BACKTEST_UNIVERSE, start_date=start_date, end_date=end_date,
+                starting_capital=capital, use_vix_filter=use_multi,
+                use_multi_factor=use_multi, strategy_name=name,
+            )
         return result
     except Exception as e:
         logger.error(f"Backtest error: {e}")

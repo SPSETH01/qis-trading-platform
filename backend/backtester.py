@@ -262,7 +262,7 @@ def run_core_satellite(universe, start_date, end_date, starting_capital=1_000_00
             continue
 
         # VIX and regime
-        vix = float(vix_close.iloc[i]) if len(vix_close) > i and not pd.isna(vix_close.iloc[i]) else 20.0
+        vix = float(vix_close.iloc[i]) if len(vix_close) > i and not bool(pd.isna(float(vix_close.iloc[i]))) else 20.0
 
         spy_above_ema200 = True
         if "SPY" in close.columns and i >= 50:
