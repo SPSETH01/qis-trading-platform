@@ -1,7 +1,7 @@
 import asyncio
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +17,7 @@ from strategies.macro_regime import MacroRegimeStrategy
 from strategies.crypto_trend import CryptoTrendStrategy
 from strategies.thematic_rotation import ThematicRotationStrategy
 from trade_logger import log_trade, get_trades, get_trade_summary
+from backtester import run_backtest, run_comparison
 
 load_dotenv()
 
@@ -829,6 +830,54 @@ async def trigger_scheduled_strategy(strategy: str):
         "strategy":  strategy,
         "timestamp": datetime.now(ET).isoformat(),
     }
+
+
+# ─── BACKTEST ─────────────────────────────────────────────────
+
+BACKTEST_UNIVERSE = [
+    "BOTZ", "ROBO", "CIBR", "SOXX", "QTUM",
+    "NUKZ", "ICLN", "TAN",
+    "ITA", "XAR",
+    "ARKG", "XBI", "IBB",
+    "INDA", "EEM",
+    "QQQ", "XLK", "XLV", "XLE",
+]
+
+@app.get("/api/backtest/run")
+async def backtest_run(years: int = 3, capital: float = 1000000, strategy: str = "tier1"):
+    """Run backtest for N years"""
+    try:
+        end_date   = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=years*365)).strftime("%Y-%m-%d")
+        use_multi  = strategy != "original"
+        name       = "Tier 1 (Multi-Factor + VIX)" if use_multi else "Original (3M Momentum)"
+        result = await run_in_threadpool(
+            run_backtest,
+            universe=BACKTEST_UNIVERSE, start_date=start_date, end_date=end_date,
+            starting_capital=capital, use_vix_filter=use_multi,
+            use_multi_factor=use_multi, strategy_name=name,
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Backtest error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/backtest/compare")
+async def backtest_compare(years: int = 3, capital: float = 1000000):
+    """Compare Original vs Tier 1 vs SPY"""
+    try:
+        end_date   = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=years*365)).strftime("%Y-%m-%d")
+        result = await run_in_threadpool(
+            run_comparison,
+            universe=BACKTEST_UNIVERSE, start_date=start_date,
+            end_date=end_date, starting_capital=capital,
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Backtest compare error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ─── MAIN ─────────────────────────────────────────────────────
 
